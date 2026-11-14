@@ -17,6 +17,7 @@ import { withOutboundSyncGuard } from "../WebSyncManager";
 import { buildVaultIdentity } from "../vaultIdentity";
 import { collectWebFolderItems, joinFolderPath, resolveShareFolder, toSharePath } from "../vaultRootPath";
 import { copyToClipboard } from "../utils/clipboard";
+import { localFolderRow } from "../localFolderRow";
 
 export class ShareManagementModal extends Modal {
 	private shares: ShareWithServer[] = [];
@@ -497,23 +498,26 @@ export class ShareManagementModal extends Modal {
 		contentEl.createEl("h4", { text: "Local folder" });
 
 		if (localFolder) {
-			const missing = localFolder.folderMissing;
+			const state = localFolderRow(localFolder);
 			const row = new Setting(contentEl)
 				.setName(localFolder.path)
 				.setDesc(
-					missing
+					state.kind === "missing"
 						? "Folder not found. Nothing syncs until it is re-linked or recreated."
-						: "Connected and syncing",
+						: state.kind === "stuck"
+							? `${state.count} file${state.count === 1 ? "" : "s"} not uploaded for more than 7 days`
+							: "Connected and syncing",
 				);
-			if (missing) {
-				// Synced folders -> "Folder not found": Re-link, Recreate, Remove.
+			if (state.kind !== "syncing") {
+				// The share's own settings page: "Folder not found" (Re-link,
+				// Recreate, Remove) or the ">7 days" block (Show files, Retry).
 				row.addButton((button) => {
 					button
-						.setButtonText("Fix folder")
+						.setButtonText(state.kind === "missing" ? "Fix folder" : "Show files")
 						.setCta()
 						.onClick(() => {
 							this.close();
-							void this.plugin.showSettingsTab(`/shared-folders?id=${localFolder.entityGuid}`);
+							void this.plugin.showSettingsTab(state.page);
 						});
 				});
 			}
