@@ -13,6 +13,7 @@
 	import { withOutboundSyncGuard } from "../WebSyncManager";
 	import { pushFolderContentToServer as pushFolderContentToServerCore } from "../webPublish/pushFolderContentToServer";
 	import { uiText } from "../wording/uiText";
+	import { localFolderRow } from "../localFolderRow";
 	import { collectWebFolderItems, joinFolderPath, resolveShareFolder, toSharePath } from "../vaultRootPath";
 
 	export let live: TeamRelayPlugin;
@@ -609,15 +610,22 @@
 	let isConnectedLocally = false;
 	let localFolderPath = "";
 	let localFolderMissing = false;
+	/** Files of the local folder not uploaded for more than 7 days. */
+	let localFolderStuck = 0;
 
 	function checkLocalConnection() {
 		const localFolder = live.shareRegistry.locate((sf) => sf.entityGuid === share.id);
 		isConnectedLocally = !!localFolder;
 		localFolderPath = localFolder ? localFolder.path : "";
-		localFolderMissing = localFolder ? localFolder.folderMissing : false;
+		const state = localFolder ? localFolderRow(localFolder) : undefined;
+		localFolderMissing = state?.kind === "missing";
+		localFolderStuck = state?.kind === "stuck" ? state.count : 0;
 	}
 
-	/** Opens Synced folders -> "Folder not found" (Re-link, Recreate, Remove). */
+	/**
+	 * Opens the share's page in Synced folders: "Folder not found" (Re-link,
+	 * Recreate, Remove) or the ">7 days" block (Show files, Retry).
+	 */
 	function fixFolder() {
 		void live.showSettingsTab(`/shared-folders?id=${share.id}`);
 	}
@@ -689,6 +697,8 @@
 							<span class="evc-connection-path">{localFolderPath}</span>
 							{#if localFolderMissing}
 								<span class="evc-connection-status evc-connection-missing">{uiText("shareDetail.localFolder.missingStatus")}</span>
+							{:else if localFolderStuck > 0}
+								<span class="evc-connection-status evc-connection-missing">{uiText(localFolderStuck === 1 ? "shareDetail.localFolder.stuckStatusOne" : "shareDetail.localFolder.stuckStatusOther", { count: localFolderStuck })}</span>
 							{:else}
 								<span class="evc-connection-status">{uiText("shareDetail.localFolder.connectedStatus")}</span>
 							{/if}
@@ -696,6 +706,8 @@
 						<div class="evc-connection-actions">
 							{#if localFolderMissing}
 								<button class="mod-cta evc-small-btn" on:click={fixFolder}>{uiText("shareDetail.localFolder.fixButton")}</button>
+							{:else if localFolderStuck > 0}
+								<button class="mod-cta evc-small-btn" on:click={fixFolder}>{uiText("shareDetail.localFolder.stuckButton")}</button>
 							{/if}
 							<button class="evc-btn-danger evc-small-btn" on:click={disconnectFolder}>{uiText("shareDetail.localFolder.disconnectButton")}</button>
 						</div>
