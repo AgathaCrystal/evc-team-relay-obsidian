@@ -797,7 +797,7 @@ export class VaultShare extends ProviderBacked {
 	 * that was online during the move, every tool-named root the share no
 	 * longer tracks while `artifacts/<root>` is a tracked folder. The live check
 	 * matters because applyServerMoves() only runs once per start, so an online
-	 * client never fills followedMoveSkips (#e8240f53).
+	 * client never fills followedMoveSkips.
 	 */
 	serverMoveRemnantRoots(): Set<string> {
 		const roots = new Set<string>(this.followedMoveSkips);

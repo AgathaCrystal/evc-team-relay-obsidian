@@ -9,7 +9,7 @@
  * destination already existed locally, or the old copy still holds files that
  * are not byte-identical. The share no longer tracks that root, so publishing
  * it to the web brings the moved roots back on the public page and makes the
- * next relocation run refuse with a destination collision (#e8240f53).
+ * next relocation run refuse with a destination collision.
  *
  * Every builder of the list goes through collectWebFolderItems(), which asks
  * this registry, so a new call site cannot forget the filter.

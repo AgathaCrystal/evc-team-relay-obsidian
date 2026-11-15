@@ -143,7 +143,7 @@ export class WebSyncManager {
 	}
 
 	/**
-	 * A share's set of paths kept out of web_folder_items changed (#e8240f53):
+	 * A share's set of paths kept out of web_folder_items changed:
 	 * nothing on disk changed, so no vault event would push the corrected
 	 * list. Schedule it like any other change; an identical list is not sent.
 	 */

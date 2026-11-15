@@ -102,7 +102,7 @@ export function joinFolderPath(folderPath: string, relativePath: string): string
 export function collectWebFolderItems(folder: TFolder, folderPath: string): WebFolderEntry[] {
 	const items: WebFolderEntry[] = [];
 	// Leftovers of a server-side move stay on disk but are not part of the
-	// share (#e8240f53): skip them and everything under them.
+	// share: skip them and everything under them.
 	const excluded = currentWebFolderExclusion();
 	const process = (f: TFolder) => {
 		for (const child of f.children) {

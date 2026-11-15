@@ -1,5 +1,5 @@
 /**
- * #e8240f53: a client that was ONLINE while the server moved a share's roots
+ * A client that was ONLINE while the server moved a share's roots
  * into `artifacts/` (relocate-artifacts) kept some old roots on disk (their
  * destination already existed locally, or the old copy was not empty) and
  * published them back into `web_folder_items` from disk. The share's CRDT no
@@ -124,7 +124,7 @@ function makeManager(vault: Vault) {
 
 const paths = (items: WebFolderEntry[]) => items.map((item) => item.path).sort();
 
-describe("web_folder_items after a server move seen by an online client (#e8240f53)", () => {
+describe("web_folder_items after a server move seen by an online client", () => {
 	const unregister: Array<() => void> = [];
 	afterEach(() => {
 		unregister.splice(0).forEach((stop) => stop());
