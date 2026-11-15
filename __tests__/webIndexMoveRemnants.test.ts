@@ -16,8 +16,10 @@ import { describe, test, expect, jest, beforeEach, afterEach } from "@jest/globa
 import * as Y from "yjs";
 import { TFile, TFolder, type Vault } from "obsidian";
 import { VaultShare } from "../src/VaultShare";
+import { Document } from "../src/Document";
+import { CanvasDocument } from "../src/CanvasDocument";
 import { FolderIndex } from "../src/FolderIndex";
-import { makeFolderRecord, makeDocumentRecord } from "../src/ItemKinds";
+import { makeFolderRecord, makeDocumentRecord, makeCanvasRecord, type ItemRecord } from "../src/ItemKinds";
 import type { AttachmentSyncSettings } from "../src/AttachmentSyncSettings";
 import { WebSyncManager } from "../src/WebSyncManager";
 import type { RelayOnPremShareClientManager } from "../src/RelayOnPremShareClientManager";
@@ -30,7 +32,7 @@ const MockTFolder = TFolder as unknown as new (path: string) => TFolder;
 const MockTFile = TFile as unknown as new (path: string) => TFile;
 
 /** The share's synced records after the server moved aaaa1111 and bbbb2222 under artifacts/. */
-function postMoveIndex(extra: Record<string, ReturnType<typeof makeFolderRecord>> = {}): FolderIndex {
+function postMoveIndex(extra: Record<string, ItemRecord> = {}): FolderIndex {
 	const doc = new Y.Doc();
 	doc.transact(() => {
 		const meta = doc.getMap("filemeta_v0");
@@ -95,15 +97,45 @@ function onlineShare(
 	return share;
 }
 
-/** An in-memory entry bound to `entryPath`, like a Document the client already tracks. */
-function boundEntry(guid: string, entryPath: string) {
-	return {
+/** The on-disk TFile at `entryPath` under SHARE. */
+function fileAt(vault: Vault, entryPath: string): TFile {
+	const file = vault.getAbstractFileByPath(`${SHARE}/${entryPath}`);
+	if (!(file instanceof TFile)) throw new Error(`no file at ${entryPath}`);
+	return file;
+}
+
+/**
+ * A real Document (prototype methods: relocate, obsidianFile, syncToVault)
+ * bound to `entryPath`, with its TFile already cached as after a first save.
+ */
+function boundDocument(guid: string, entryPath: string, vault: Vault, extra: Record<string, unknown> = {}): Document {
+	const doc = Object.create(Document.prototype) as Document;
+	const crdtDoc = new Y.Doc();
+	crdtDoc.getText("contents").insert(0, "final report");
+	Object.assign(doc, {
 		entityGuid: guid,
 		entryPath,
-		relocate(newPath: string) {
-			this.entryPath = newPath;
-		},
-	};
+		crdtDoc,
+		obsidianVault: vault,
+		fileMetrics: { ctime: 0, mtime: 0, size: 0 },
+		warn: () => {},
+		...extra,
+	});
+	doc._obsidianFile = fileAt(vault, entryPath);
+	return doc;
+}
+
+/** A real CanvasDocument bound to `entryPath` with its TFile cached. */
+function boundCanvas(guid: string, entryPath: string, vault: Vault): CanvasDocument {
+	const canvas = Object.create(CanvasDocument.prototype) as CanvasDocument;
+	Object.assign(canvas, {
+		entityGuid: guid,
+		entryPath,
+		crdtDoc: new Y.Doc(),
+		crdtStat: { ctime: 0, mtime: 0, size: 0 },
+	});
+	canvas._obsidianFile = fileAt(vault, entryPath);
+	return canvas;
 }
 
 function makeManager(vault: Vault) {
@@ -221,43 +253,87 @@ describe("web_folder_items after a server move seen by an online client", () => 
 		const refresh = (share: VaultShare) =>
 			(share as unknown as { refreshServerMoveRemnants(): void }).refreshServerMoveRemnants();
 
-		test("is re-bound to the path the share records for its guid", () => {
-			const { vault, inScope } = disk(["aaaa1111/report.md", "artifacts/aaaa1111/report.md"]);
-			const entry = boundEntry("d1", "aaaa1111/report.md");
+		/** A share over `vault` holding `entries`, with the vault surface a save goes through. */
+		const shareWith = (
+			vault: Vault,
+			inScope: () => Array<TFile | TFolder>,
+			entries: Array<Document | CanvasDocument | { entityGuid: string; entryPath: string }>,
+		) => {
+			(vault as unknown as { modify: unknown }).modify = jest.fn(async () => undefined);
 			const share = onlineShare(postMoveIndex(), inScope, [], {
 				vaultApi: vault,
-				trackedEntries: new Map([["d1", entry]]),
+				awaitingDelete: new Set<string>(),
+				trackedEntries: new Map(entries.map((entry) => [entry.entityGuid, entry])),
 			});
+			for (const entry of entries) {
+				if (entry instanceof Document || entry instanceof CanvasDocument) {
+					(entry as unknown as { _parent: VaultShare })._parent = share;
+				}
+			}
+			return share;
+		};
+		const savedPaths = (vault: Vault) =>
+			(vault.modify as unknown as jest.Mock).mock.calls.map(([file]) => (file as { path: string }).path);
+
+		test("is re-bound to the recorded path, and its next save lands there, not in the old copy", () => {
+			const { vault, inScope } = disk(["aaaa1111/report.md", "artifacts/aaaa1111/report.md"]);
+			const doc = boundDocument("d1", "aaaa1111/report.md", vault);
+			const share = shareWith(vault, inScope, [doc]);
+
+			refresh(share);
+			doc.syncToVault();
+
+			expect(doc.entryPath).toBe("artifacts/aaaa1111/report.md");
+			expect(doc.obsidianFile?.path).toBe(`${SHARE}/artifacts/aaaa1111/report.md`);
+			expect(savedPaths(vault)).toEqual([`${SHARE}/artifacts/aaaa1111/report.md`]);
+		});
+
+		test("a canvas drops its cached file the same way", () => {
+			const { vault, inScope } = disk(["aaaa1111/board.canvas", "artifacts/aaaa1111/board.canvas"]);
+			const canvas = boundCanvas("c1", "aaaa1111/board.canvas", vault);
+			const index = postMoveIndex({ "artifacts/aaaa1111/board.canvas": makeCanvasRecord("c1") });
+			const share = onlineShare(index, inScope, [], {
+				vaultApi: vault,
+				trackedEntries: new Map([["c1", canvas]]),
+			});
+			(canvas as unknown as { _parent: VaultShare })._parent = share;
 
 			refresh(share);
 
-			expect(entry.entryPath).toBe("artifacts/aaaa1111/report.md");
+			expect(canvas.entryPath).toBe("artifacts/aaaa1111/board.canvas");
+			expect(canvas.obsidianFile?.path).toBe(`${SHARE}/artifacts/aaaa1111/board.canvas`);
 		});
 
 		test("stays put while the recorded path is not on disk yet (the tree scan renames it)", () => {
 			const { vault, inScope } = disk(["aaaa1111/report.md"], ["artifacts/aaaa1111"]);
-			const entry = boundEntry("d1", "aaaa1111/report.md");
-			const share = onlineShare(postMoveIndex(), inScope, [], {
-				vaultApi: vault,
-				trackedEntries: new Map([["d1", entry]]),
-			});
+			const doc = boundDocument("d1", "aaaa1111/report.md", vault);
+			const share = shareWith(vault, inScope, [doc]);
 
 			refresh(share);
+			doc.syncToVault();
 
-			expect(entry.entryPath).toBe("aaaa1111/report.md");
+			expect(doc.entryPath).toBe("aaaa1111/report.md");
+			expect(savedPaths(vault)).toEqual([`${SHARE}/aaaa1111/report.md`]);
 		});
 
 		test("entries outside leftovers are never moved", () => {
 			const { vault, inScope } = disk(["Projects/plan.md", "artifacts/aaaa1111/report.md", "aaaa1111/x.md"]);
-			const entry = boundEntry("d1", "Projects/plan.md");
-			const share = onlineShare(postMoveIndex(), inScope, [], {
-				vaultApi: vault,
-				trackedEntries: new Map([["d1", entry]]),
-			});
+			const doc = boundDocument("d1", "Projects/plan.md", vault);
+			const share = shareWith(vault, inScope, [doc]);
 
 			refresh(share);
 
-			expect(entry.entryPath).toBe("Projects/plan.md");
+			expect(doc.entryPath).toBe("Projects/plan.md");
+		});
+
+		test("non-document entries (attachments, folders) are left as they are", () => {
+			const { vault, inScope } = disk(["aaaa1111/report.md", "artifacts/aaaa1111/report.md"]);
+			const other = { entityGuid: "d1", entryPath: "aaaa1111/report.md", relocate: jest.fn() };
+			const share = shareWith(vault, inScope, [other]);
+
+			refresh(share);
+
+			expect(other.relocate).not.toHaveBeenCalled();
 		});
 	});
 });

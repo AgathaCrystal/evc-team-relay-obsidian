@@ -853,10 +853,18 @@ export class VaultShare extends ProviderBacked {
 	 * requesting tokens for the old path. Point it at the recorded path, as
 	 * docAt() would; files on disk are not touched. Entries whose recorded
 	 * path is missing locally are left to the normal rename in scanFileTree().
+	 *
+	 * Only documents and canvases are re-bound: their cached TFile is dropped
+	 * so the next save resolves the recorded path. relocate() keeps that cache
+	 * because on an ordinary rename Obsidian moves the same TFile object; here
+	 * the old copy stays on disk and the cache would keep writing into it.
+	 * Attachments and folders hold their own path-bound state and are left as
+	 * they are.
 	 */
 	private rebindEntriesOutOfRemnants(roots: Set<string>): void {
-		const stale = [...(this.trackedEntries?.values() ?? [])].filter((entry) =>
-			isUnderSkippedPath(entry.entryPath, roots),
+		const stale = [...(this.trackedEntries?.values() ?? [])].filter(
+			(entry): entry is Document | CanvasDocument =>
+				(isDocument(entry) || isCanvasDocument(entry)) && isUnderSkippedPath(entry.entryPath, roots),
 		);
 		if (stale.length === 0) return;
 		const recordedPath = new Map<string, string>();
@@ -868,6 +876,7 @@ export class VaultShare extends ProviderBacked {
 			if (!this.hasFileSync(target)) continue;
 			console.debug(`[VaultShare] ${this.path}: re-bound ${entry.entityGuid} from ${entry.entryPath} to ${target} after a server move`);
 			entry.relocate(target, this);
+			entry._obsidianFile = null;
 			moved++;
 		}
 		if (moved > 0) this.pathSet?.update();
