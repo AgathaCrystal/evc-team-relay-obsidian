@@ -51,6 +51,11 @@ export class InboundFileDownloader {
 	// without going through either resolve path).
 	private conflicts: Map<string, SyncConflict> = new Map();
 
+	// Called after every completed pass over a share (and after "keep local"),
+	// so the outbound writer can retry paths that waited for an external
+	// version to be pulled first.
+	private passListener: ((shareId: string) => void) | null = null;
+
 	constructor(
 		vault: Vault,
 		private readonly fileManager: FileManager,
@@ -70,6 +75,10 @@ export class InboundFileDownloader {
 	 */
 	isInboundWriting(vaultPath: string): boolean {
 		return this.writingPaths.has(vaultPath);
+	}
+
+	setPassListener(listener: ((shareId: string) => void) | null): void {
+		this.passListener = listener;
 	}
 
 	/**
@@ -119,17 +128,35 @@ export class InboundFileDownloader {
 			return "ran";
 		}
 
-		const shareManifest = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
+		const before = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
+		const shareManifest = { ...before };
 
 		try {
 			for (const item of syncItems) {
-				await this._downloadItem(item.path, item.sha256, shareId, serverId, sharePath, shareManifest);
+				await this._downloadItem(
+					item.path,
+					item.sha256,
+					shareId,
+					serverId,
+					sharePath,
+					shareManifest,
+					item.origin,
+				);
 			}
 		} finally {
 			// Keep completed files when a transport failure stops the batch. Its
 			// watermark stays unchanged so the next pass retries unfinished files.
-			this.lastWrittenHash.set(shareId, shareManifest);
+			// Merge only what this pass changed: the outbound writer records its
+			// own bases in the same store while a pass is running.
+			// A key the store no longer holds at its snapshot value was written
+			// by the writer during this pass; its newer base wins.
+			const merged = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
+			for (const [path, sha] of Object.entries(shareManifest)) {
+				if (before[path] !== sha && merged[path] === before[path]) merged[path] = sha;
+			}
+			this.lastWrittenHash.set(shareId, merged);
 		}
+		this.passListener?.(shareId);
 		return "ran";
 	}
 
@@ -140,6 +167,7 @@ export class InboundFileDownloader {
 		serverId: string,
 		sharePath: string,
 		shareManifest: Record<string, string>,
+		origin?: string,
 	): Promise<void> {
 		const vaultPath = normalizePath(join(sharePath, relativePath));
 
@@ -167,6 +195,23 @@ export class InboundFileDownloader {
 			return;
 		}
 
+		const abstractFile = this.vault.getAbstractFileByPath(vaultPath);
+
+		// A crdt-origin item is some client's mirror of the live CRDT text
+		//: the relay already delivers it to this vault, and writing
+		// the file here as well would duplicate lines in an open note. Only
+		// adopt it as the base once the local file holds exactly that text.
+		if (origin === "crdt") {
+			if (abstractFile instanceof TFile) {
+				const localHash = await this._localHash(abstractFile, vaultPath);
+				if (localHash === serverSha256) {
+					shareManifest[relativePath] = serverSha256;
+					this.conflicts.delete(`${shareId}:${relativePath}`);
+				}
+			}
+			return;
+		}
+
 		// Guard against overwriting user edits:
 		// If the file exists locally, check it against `lastHash` — what we last
 		// wrote for this path — regardless of whether `lastHash` is defined. It
@@ -177,20 +222,18 @@ export class InboundFileDownloader {
 		// that doesn't match local content -> user edit, skip. No history at all
 		// but the local file doesn't match what we're about to write -> unknown
 		// provenance, ALSO skip rather than assume it's safe to overwrite.
-		const abstractFile = this.vault.getAbstractFileByPath(vaultPath);
 		if (abstractFile instanceof TFile) {
 			// Only the read + hash computation is I/O that can legitimately fail;
 			// the notify-and-skip decision below is not wrapped, so a bug there
 			// surfaces as itself instead of being mislabeled a read failure.
-			let localHash: string;
-			try {
-				const localBytes = await this.vault.readBinary(abstractFile);
-				localHash = await sha256Hex(localBytes);
-			} catch (err: unknown) {
-				log("Could not read existing file, skipping to avoid data loss", {
-					vaultPath,
-					error: err instanceof Error ? err.message : String(err),
-				});
+			const localHash = await this._localHash(abstractFile, vaultPath);
+			if (localHash === undefined) return;
+			// The vault already holds exactly the server's version (e.g. it
+			// arrived through the CRDT, or this client wrote it): nothing to
+			// write, only the base moves.
+			if (localHash === serverSha256) {
+				shareManifest[relativePath] = serverSha256;
+				this.conflicts.delete(`${shareId}:${relativePath}`);
 				return;
 			}
 			const expectedHash = lastHash ?? serverSha256;
@@ -278,6 +321,20 @@ export class InboundFileDownloader {
 		}
 	}
 
+	/** sha256 of the local file, or undefined when it cannot be read (then nothing is written). */
+	private async _localHash(file: TFile, vaultPath: string): Promise<string | undefined> {
+		try {
+			const localBytes = await this.vault.readBinary(file);
+			return await sha256Hex(localBytes);
+		} catch (err: unknown) {
+			log("Could not read existing file, skipping to avoid data loss", {
+				vaultPath,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return undefined;
+		}
+	}
+
 	/** All currently-unresolved sync conflicts, for the "Show sync conflicts" command. */
 	getConflicts(): SyncConflict[] {
 		return Array.from(this.conflicts.values());
@@ -316,6 +373,9 @@ export class InboundFileDownloader {
 		shareManifest[relativePath] = conflict.serverHash;
 		this.lastWrittenHash.set(shareId, shareManifest);
 		this.conflicts.delete(key);
+		// The server version is now this client's base, so the outbound
+		// writer may push the kept local text over it.
+		this.passListener?.(shareId);
 	}
 
 	destroy(): void {

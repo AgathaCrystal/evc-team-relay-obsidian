@@ -252,6 +252,8 @@ export default class TeamRelayPlugin extends Plugin {
 	public webSyncManager?: import("./WebSyncManager").WebSyncManager;
 	public inboundFileDownloader?: import("./InboundFileDownloader").InboundFileDownloader;
 	public inboundSyncPoller?: import("./InboundSyncPoller").InboundSyncPoller;
+	public outboundSyncWriter?: import("./OutboundSyncWriter").OutboundSyncWriter;
+	private stopOutboundReconnectWatch?: () => void;
 
 	// Logging (bound in the constructor via instanceLabels/namedLogger)
 	logDebug!: (...args: unknown[]) => void;
@@ -783,6 +785,33 @@ export default class TeamRelayPlugin extends Plugin {
 				this.webSyncManager,
 				hashManifestStore,
 			);
+
+			// Outbound mirror of local edits into the sync protocol.
+			// Shares the downloader's base store: "the version this client
+			// pulled" is exactly what If-Match may replace.
+			const { createOutboundSyncWriter, watchShareReconnects } = await import(
+				"./outboundSyncWiring"
+			);
+			this.outboundSyncWriter = createOutboundSyncWriter({
+				vault: this.app.vault,
+				clock: this.clock,
+				shareRegistry: this.shareRegistry,
+				clientManager: this.shareClientManager,
+				baseStore: hashManifestStore,
+			});
+			const outboundWriter = this.outboundSyncWriter;
+			this.inboundFileDownloader.setPassListener((shareId) =>
+				outboundWriter.onInboundPass(shareId),
+			);
+			this.app.workspace.onLayoutReady(() => {
+				if (this.outboundSyncWriter !== outboundWriter) return;
+				this.stopOutboundReconnectWatch = watchShareReconnects({
+					vault: this.app.vault,
+					clock: this.clock,
+					shareRegistry: this.shareRegistry,
+					writer: outboundWriter,
+				});
+			});
 
 			this.addCommand({
 				id: "show-sync-conflicts",
@@ -1987,6 +2016,16 @@ export default class TeamRelayPlugin extends Plugin {
 				if (this.webSyncManager && tfile instanceof TFile) {
 					this.webSyncManager.onFileCreated(tfile);
 				}
+				// A new note reaches the sync protocol too. Files that
+				// already exist fire this on vault load; the reconnect reconcile
+				// covers those, so only creates after layout-ready count.
+				if (
+					tfile instanceof TFile &&
+					this.app.workspace.layoutReady &&
+					!(this.inboundFileDownloader?.isInboundWriting(tfile.path) ?? false)
+				) {
+					this.outboundSyncWriter?.notifyLocalChange(tfile.path);
+				}
 			}),
 		);
 
@@ -2082,6 +2121,11 @@ export default class TeamRelayPlugin extends Plugin {
 				// Handle auto-sync to web (v1.8.1); skip if InboundFileDownloader is writing (echo-loop guard, v1.9)
 				if (this.webSyncManager && tfile instanceof TFile && !isInboundEcho) {
 					void this.webSyncManager.onFileModified(tfile);
+				}
+				// Mirror the edit into the sync protocol; never an
+				// inbound-download echo.
+				if (tfile instanceof TFile && !isInboundEcho) {
+					this.outboundSyncWriter?.notifyLocalChange(tfile.path);
 				}
 			}),
 		);
@@ -2263,6 +2307,14 @@ export default class TeamRelayPlugin extends Plugin {
 		if (this.inboundSyncPoller) {
 			this.inboundSyncPoller.destroy();
 			this.inboundSyncPoller = undefined;
+		}
+
+		// Cleanup OutboundSyncWriter
+		this.stopOutboundReconnectWatch?.();
+		this.stopOutboundReconnectWatch = undefined;
+		if (this.outboundSyncWriter) {
+			this.outboundSyncWriter.destroy();
+			this.outboundSyncWriter = undefined;
 		}
 
 		// Cleanup InboundFileDownloader (v1.9)
