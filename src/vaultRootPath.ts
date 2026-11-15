@@ -2,6 +2,7 @@
 
 import { TFile, TFolder, type Vault } from "obsidian";
 import type { WebFolderEntry } from "./RelayOnPremShareClient";
+import { currentWebFolderExclusion } from "./webFolderExclusions";
 
 /**
  * Obsidian's own vault root `TFolder` reports `.path === "/"` -- but the
@@ -91,7 +92,7 @@ export function joinFolderPath(folderPath: string, relativePath: string): string
 /**
  * Recursively lists a share folder's contents (md/canvas files + subfolders)
  * as `WebFolderEntry[]` for `web_folder_items`, honoring the vault-root path
- * convention.
+ * convention and leaving out paths excluded via webFolderExclusions.
  *
  * Single implementation shared by every `getFolderItems()` call site
  * (previously duplicated three times -- WebSyncManager, ShareManagementModal,
@@ -100,8 +101,12 @@ export function joinFolderPath(folderPath: string, relativePath: string): string
  */
 export function collectWebFolderItems(folder: TFolder, folderPath: string): WebFolderEntry[] {
 	const items: WebFolderEntry[] = [];
+	// Leftovers of a server-side move stay on disk but are not part of the
+	// share (#e8240f53): skip them and everything under them.
+	const excluded = currentWebFolderExclusion();
 	const process = (f: TFolder) => {
 		for (const child of f.children) {
+			if (excluded?.(child.path)) continue;
 			const rel = toFolderRelativePath(child.path, folderPath);
 			if (child instanceof TFile) {
 				if (child.extension === "canvas") {

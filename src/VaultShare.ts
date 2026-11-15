@@ -66,8 +66,13 @@ import { buildConflictCopyPath, isConflictCopyPath } from "./conflictCopyPath";
 import { partitionByKnownGuid } from "./mintGate";
 import { DocActivityChannel } from "./docActivity";
 import {
+	notifyWebFolderExclusionsChanged,
+	registerWebFolderExclusion,
+} from "./webFolderExclusions";
+import {
 	findServerMoves,
 	findStructuralMoves,
+	isRelocatableRoot,
 	isUnderSkippedPath,
 	takeRecordSnapshot,
 	type RecordSnapshot,
@@ -297,6 +302,7 @@ export class VaultShare extends ProviderBacked {
 		// every one of them would look unfulfillable and be dropped.
 		if (!this.dormant) this._settleUploadClaims();
 		this._wireSyncStoreListener();
+		this.teardowns.push(registerWebFolderExclusion(this));
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
 		this.rootRelative = withRootRelativePaths(this, this.path, (globalPath: string) => {
@@ -728,6 +734,7 @@ export class VaultShare extends ProviderBacked {
 						const persisted = await this.recordsBeforeSync();
 						await this.onceFreshlySynced();
 						await this.applyServerMoves(persisted);
+						this.refreshServerMoveRemnants();
 					}
 					return !this.isTornDown;
 				})(),
@@ -782,6 +789,59 @@ export class VaultShare extends ProviderBacked {
 				console.warn(`[VaultShare] ${this.path}: could not follow server move ${from} -> ${to}`, e);
 			}
 		}
+	}
+
+	/**
+	 * Top-level roots that are leftovers of a server move and must stay out of
+	 * the share and its web index: roots skipped at startup, plus, for a client
+	 * that was online during the move, every tool-named root the share no
+	 * longer tracks while `artifacts/<root>` is a tracked folder. The live check
+	 * matters because applyServerMoves() only runs once per start, so an online
+	 * client never fills followedMoveSkips (#e8240f53).
+	 */
+	serverMoveRemnantRoots(): Set<string> {
+		const roots = new Set<string>(this.followedMoveSkips);
+		if (this.isTornDown || !this.folderIndex) return roots;
+		let candidates: string[] = [];
+		try {
+			candidates = this.vaultFilesInScope()
+				.filter((file) => file instanceof TFolder)
+				.map((folder) => this.toVirtualPath(folder.path))
+				.filter((vpath) => !vpath.includes("/") && isRelocatableRoot(vpath));
+		} catch {
+			// No on-disk folder yet: nothing local can be a leftover.
+		}
+		if (candidates.length === 0) return roots;
+		for (const move of findStructuralMoves(candidates, takeRecordSnapshot(this.folderIndex))) {
+			roots.add(move.from);
+		}
+		return roots;
+	}
+
+	/** webFolderExclusions source: hides server-move leftovers from web_folder_items. */
+	webFolderExclusion(): ((vaultPath: string) => boolean) | null {
+		const roots = this.serverMoveRemnantRoots();
+		if (roots.size === 0) return null;
+		return (vaultPath) =>
+			this.containsPath(vaultPath) && isUnderSkippedPath(this.toVirtualPath(vaultPath), roots);
+	}
+
+	private serverMoveRemnantSignature = "";
+
+	/**
+	 * Re-publish the web index when the set of leftovers changes. The PATCH
+	 * that raced the move already listed them, and nothing else on disk
+	 * changes afterwards to trigger another one.
+	 */
+	private refreshServerMoveRemnants(): void {
+		if (this.isTornDown) return;
+		const signature = [...this.serverMoveRemnantRoots()].sort().join(", ");
+		if (signature === (this.serverMoveRemnantSignature ?? "")) return;
+		this.serverMoveRemnantSignature = signature;
+		if (signature) {
+			console.debug(`[VaultShare] ${this.path}: server-move leftovers kept out of the share: ${signature}`);
+		}
+		notifyWebFolderExclusionsChanged(this.path);
 	}
 
 	/**
@@ -862,9 +922,10 @@ export class VaultShare extends ProviderBacked {
 		let syncTFiles = this.vaultFilesInScope().filter(
 			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
 		);
-		if (this.followedMoveSkips.size > 0) {
+		const remnants = this.serverMoveRemnantRoots();
+		if (remnants.size > 0) {
 			syncTFiles = syncTFiles.filter(
-				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), this.followedMoveSkips),
+				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), remnants),
 			);
 		}
 		if (!allowMint) {
@@ -2132,6 +2193,7 @@ export class VaultShare extends ProviderBacked {
 				if (renames.length > 0 || creates.length > 0 || deletes.length > 0) {
 					this.pathSet.update();
 				}
+				this.refreshServerMoveRemnants();
 			} finally {
 				// Clear the in-flight marker whether this pass succeeded or threw.
 				this.treeScanInFlight = null;

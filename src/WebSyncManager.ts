@@ -15,6 +15,7 @@ import {
 	resolveShareFolder,
 	toFolderRelativePath,
 } from "./vaultRootPath";
+import { onWebFolderExclusionsChanged } from "./webFolderExclusions";
 
 const log = namedLogger("[WebSyncManager]");
 
@@ -127,12 +128,33 @@ export class WebSyncManager {
 	// Coalesced web_folder_items push state per folder share, keyed by folder path.
 	private folderItemsPush: Map<string, FolderItemsPushState> = new Map();
 
+	// Stops listening for web-index exclusion changes (server-move leftovers).
+	private stopExclusionUpdates: () => void;
+
 	constructor(
 		vault: Vault,
 		clientManager: RelayOnPremShareClientManager
 	) {
 		this.vault = vault;
 		this.clientManager = clientManager;
+		this.stopExclusionUpdates = onWebFolderExclusionsChanged((folderPath) =>
+			this.onFolderExclusionsChanged(folderPath),
+		);
+	}
+
+	/**
+	 * A share's set of paths kept out of web_folder_items changed (#e8240f53):
+	 * nothing on disk changed, so no vault event would push the corrected
+	 * list. Schedule it like any other change; an identical list is not sent.
+	 */
+	private onFolderExclusionsChanged(folderPath: string): void {
+		const shareInfo = this.autoSyncShares.get(folderPath);
+		if (!shareInfo || shareInfo.kind !== "folder") return;
+		log("Web index exclusions changed, scheduling web_folder_items update", {
+			folderPath,
+			shareId: shareInfo.shareId,
+		});
+		this.scheduleFolderItemsPush(folderPath, shareInfo);
 	}
 
 	/**
@@ -815,6 +837,7 @@ export class WebSyncManager {
 	 */
 	destroy(): void {
 		log("Destroying WebSyncManager");
+		this.stopExclusionUpdates();
 		this.autoSyncShares.clear();
 		this.debouncedSyncMap.clear();
 		for (const folderPath of Array.from(this.folderItemsPush.keys())) {
