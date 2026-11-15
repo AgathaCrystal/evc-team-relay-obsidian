@@ -42,6 +42,8 @@ export interface SyncArtifactItem {
 	size: number;
 	updated_at: string;
 	type?: string;
+	/** "crdt" = a client's mirror of the live CRDT text; absent = external. */
+	origin?: "crdt" | "external";
 }
 
 /**
@@ -184,6 +186,8 @@ export interface ServerFeatures {
 	web_publish_enabled?: boolean;
 	web_publish_domain?: string | null;
 	billing_enabled?: boolean;
+	/** sync-write honours X-Sync-Origin and files-index reports `origin`. */
+	sync_write_origin?: boolean;
 }
 
 /**
@@ -814,7 +818,9 @@ export class RelayOnPremShareClient {
 					`${this.normalizedUrl}/v1/web/shares/${slug}/files?path=${encodeURIComponent(path)}`,
 					{
 						method: "POST",
-						headers: await this.getHeaders(),
+						// Vault text of a shared folder is the CRDT's: mark it so
+						// other clients do not write it to disk again.
+						headers: { ...((await this.getHeaders()) as Record<string, string>), "X-Sync-Origin": "crdt" },
 						body: JSON.stringify({ content }),
 					},
 				);
@@ -862,11 +868,15 @@ export class RelayOnPremShareClient {
 		content: string,
 		precondition: { create: true } | { ifMatchSha256: string },
 		mime = "text/markdown; charset=utf-8",
+		options: { origin?: "crdt" } = {},
 	): Promise<SyncWriteResult> {
 		log(`Writing folder file content: ${shareId}/${path}`);
 
 		const headers = (await this.getHeaders()) as Record<string, string>;
 		headers["Content-Type"] = mime;
+		if (options.origin === "crdt") {
+			headers["X-Sync-Origin"] = "crdt";
+		}
 		if ("create" in precondition) {
 			headers["If-None-Match"] = "*";
 		} else {
@@ -878,7 +888,13 @@ export class RelayOnPremShareClient {
 			{ method: "PUT", headers, body: content },
 		);
 		if (!response.ok) {
-			throw new Error(`Failed to write file content: ${response.status} ${await response.text()}`);
+			// RelayHttpError keeps the status (412/429 drive the outbound
+			// writer) and Retry-After; its message is unchanged for callers.
+			throw new RelayHttpError(
+				response.status,
+				`Failed to write file content: ${response.status} ${await response.text()}`,
+				parseRetryAfterMs(response.headers.get("Retry-After")),
+			);
 		}
 		return (await response.json()) as SyncWriteResult;
 	}

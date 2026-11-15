@@ -597,6 +597,7 @@ export class RelayOnPremShareClientManager {
 		content: string,
 		precondition: { create: true } | { ifMatchSha256: string },
 		mime?: string,
+		options: { origin?: "crdt" } = {},
 	): Promise<SyncWriteResult> {
 		const client = this.clients.get(serverId);
 		if (!client) {
@@ -605,8 +606,6 @@ export class RelayOnPremShareClientManager {
 		if (!this.authManager.isLoggedInToServer(serverId)) {
 			throw new Error(`Not logged in to server ${serverId}`);
 		}
-		return mime
-			? client.syncWriteFile(shareId, path, content, precondition, mime)
-			: client.syncWriteFile(shareId, path, content, precondition);
+		return client.syncWriteFile(shareId, path, content, precondition, mime, options);
 	}
 }
