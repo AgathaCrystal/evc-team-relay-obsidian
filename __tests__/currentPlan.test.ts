@@ -65,4 +65,50 @@ describe("resolveCurrentPlanId", () => {
 		const marked = malformed.filter((p) => p.id === id);
 		expect(marked.length).toBe(0);
 	});
+
+	// Team Relay RU answers GET /v1/billing/plan with the plan CODE
+	// ("free"), while the cards carry localized names ("Свободный"). Matching by
+	// name alone found nothing, so no RU card showed the "Current" badge.
+	describe("by plan code (RU deployment, live ids)", () => {
+		const ruPlans = [
+			plan("prod_relay_ru_free", "Свободный", 0),
+			plan("prod_relay_ru_personal", "Личный", 490),
+			plan("prod_relay_ru_team", "Командный", 1990),
+		];
+
+		it("maps plan:'free' to prod_relay_ru_free", () => {
+			expect(resolveCurrentPlanId({ plan: "free" }, ruPlans)).toBe("prod_relay_ru_free");
+		});
+
+		it("maps plan:'personal' and plan:'team' to their RU products", () => {
+			expect(resolveCurrentPlanId({ plan: "personal" }, ruPlans)).toBe("prod_relay_ru_personal");
+			expect(resolveCurrentPlanId({ plan: "team" }, ruPlans)).toBe("prod_relay_ru_team");
+		});
+
+		it("does not match a code that is only a substring of an id segment", () => {
+			// "am" is inside "team" but is not its own "_am" suffix.
+			expect(resolveCurrentPlanId({ plan: "am" }, ruPlans)).toBeNull();
+		});
+
+		it("returns null when two ids end with the same code", () => {
+			const dup = [plan("a_free", "One", 0), plan("b_free", "Two", 0)];
+			expect(resolveCurrentPlanId({ plan: "free" }, dup)).toBeNull();
+		});
+	});
+
+	describe("Entire deployment (live ids) keeps working", () => {
+		const entirePlans = [
+			plan("prod_relay_free", "Free", 0),
+			plan("prod_relay_pro", "Builder", 900),
+		];
+
+		it("maps plan:'Free' and plan:'free' to prod_relay_free", () => {
+			expect(resolveCurrentPlanId({ plan: "Free" }, entirePlans)).toBe("prod_relay_free");
+			expect(resolveCurrentPlanId({ plan: "free" }, entirePlans)).toBe("prod_relay_free");
+		});
+
+		it("maps plan:'Relay Builder' to prod_relay_pro by name", () => {
+			expect(resolveCurrentPlanId({ plan: "Relay Builder" }, entirePlans)).toBe("prod_relay_pro");
+		});
+	});
 });

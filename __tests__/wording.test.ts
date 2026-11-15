@@ -356,3 +356,18 @@ describe("billing screen phrases", () => {
 		expect(billingKeys.filter((k) => !(k in ruPhrasebook))).toEqual([]);
 	});
 });
+
+// "relay-onprem" is the internal name of the server mode
+// (CSS classes and the mode id keep it). Users see "Team Relay", never the
+// technical term, in any language.
+describe("visible wording", () => {
+	it("never shows the internal term relay-onprem", () => {
+		const offenders = Object.entries(phrasebooksByLanguage).flatMap(([lang, book]) =>
+			Object.entries(book as Phrasebook)
+				.filter(([, value]) => typeof value === "string" && /relay-onprem/i.test(value))
+				.map(([key]) => `${lang}:${key}`),
+		);
+		expect(Object.keys(phrasebooksByLanguage).length).toBeGreaterThan(1); // en + ru at least
+		expect(offenders).toEqual([]);
+	});
+});

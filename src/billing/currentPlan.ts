@@ -21,6 +21,19 @@ export function resolveCurrentPlanId(
 	const declared = (data.plan || "").trim().toLowerCase();
 	if (declared === "") return null; // server named no plan - claim nothing
 
+	// Match by plan CODE first. Team Relay RU answers
+	// /billing/plan with a code ("free") while its cards carry localized names
+	// ("Свободный"), so a name-only match found nothing and no card showed
+	// "Current". A code matches an id exactly or as its last `_`-separated
+	// segment(s): "free" -> "prod_relay_ru_free". Exactly one hit wins; zero or
+	// several fall through to the name match below, which still resolves the
+	// Entire deployment's "Relay Builder" -> prod_relay_pro.
+	const byCode = plans.filter((p) => {
+		const id = typeof p.id === "string" ? p.id.trim().toLowerCase() : "";
+		return id !== "" && (id === declared || id.endsWith("_" + declared));
+	});
+	if (byCode.length === 1) return byCode[0].id || null;
+
 	const named = (p: AvailablePlan) => (p.name || "").trim().toLowerCase();
 
 	// `.id` is typed `string` (required) on AvailablePlan, but that's a
