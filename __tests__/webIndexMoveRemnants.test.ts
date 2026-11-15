@@ -77,7 +77,12 @@ function disk(files: string[], emptyFolders: string[] = []) {
 }
 
 /** A live VaultShare as far as leftover detection goes; followedMoveSkips empty = online client. */
-function onlineShare(index: FolderIndex, inScope: () => Array<TFile | TFolder>, skips: string[] = []): VaultShare {
+function onlineShare(
+	index: FolderIndex,
+	inScope: () => Array<TFile | TFolder>,
+	skips: string[] = [],
+	extra: Record<string, unknown> = {},
+): VaultShare {
 	const share = Object.create(VaultShare.prototype) as VaultShare;
 	Object.assign(share, {
 		path: SHARE,
@@ -85,8 +90,20 @@ function onlineShare(index: FolderIndex, inScope: () => Array<TFile | TFolder>, 
 		isTornDown: false,
 		followedMoveSkips: new Set<string>(skips),
 		vaultFilesInScope: inScope,
+		...extra,
 	});
 	return share;
+}
+
+/** An in-memory entry bound to `entryPath`, like a Document the client already tracks. */
+function boundEntry(guid: string, entryPath: string) {
+	return {
+		entityGuid: guid,
+		entryPath,
+		relocate(newPath: string) {
+			this.entryPath = newPath;
+		},
+	};
 }
 
 function makeManager(vault: Vault) {
@@ -197,6 +214,50 @@ describe("web_folder_items after a server move seen by an online client (#e8240f
 			await jest.advanceTimersByTimeAsync(31_000);
 			expect(updateShare).toHaveBeenCalledTimes(1);
 			manager.destroy();
+		});
+	});
+
+	describe("an entry still bound to the old path (doc keeps syncing the stale copy)", () => {
+		const refresh = (share: VaultShare) =>
+			(share as unknown as { refreshServerMoveRemnants(): void }).refreshServerMoveRemnants();
+
+		test("is re-bound to the path the share records for its guid", () => {
+			const { vault, inScope } = disk(["aaaa1111/report.md", "artifacts/aaaa1111/report.md"]);
+			const entry = boundEntry("d1", "aaaa1111/report.md");
+			const share = onlineShare(postMoveIndex(), inScope, [], {
+				vaultApi: vault,
+				trackedEntries: new Map([["d1", entry]]),
+			});
+
+			refresh(share);
+
+			expect(entry.entryPath).toBe("artifacts/aaaa1111/report.md");
+		});
+
+		test("stays put while the recorded path is not on disk yet (the tree scan renames it)", () => {
+			const { vault, inScope } = disk(["aaaa1111/report.md"], ["artifacts/aaaa1111"]);
+			const entry = boundEntry("d1", "aaaa1111/report.md");
+			const share = onlineShare(postMoveIndex(), inScope, [], {
+				vaultApi: vault,
+				trackedEntries: new Map([["d1", entry]]),
+			});
+
+			refresh(share);
+
+			expect(entry.entryPath).toBe("aaaa1111/report.md");
+		});
+
+		test("entries outside leftovers are never moved", () => {
+			const { vault, inScope } = disk(["Projects/plan.md", "artifacts/aaaa1111/report.md", "aaaa1111/x.md"]);
+			const entry = boundEntry("d1", "Projects/plan.md");
+			const share = onlineShare(postMoveIndex(), inScope, [], {
+				vaultApi: vault,
+				trackedEntries: new Map([["d1", entry]]),
+			});
+
+			refresh(share);
+
+			expect(entry.entryPath).toBe("Projects/plan.md");
 		});
 	});
 });

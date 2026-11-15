@@ -835,13 +835,42 @@ export class VaultShare extends ProviderBacked {
 	 */
 	private refreshServerMoveRemnants(): void {
 		if (this.isTornDown) return;
-		const signature = [...this.serverMoveRemnantRoots()].sort().join(", ");
+		const roots = this.serverMoveRemnantRoots();
+		if (roots.size > 0) this.rebindEntriesOutOfRemnants(roots);
+		const signature = [...roots].sort().join(", ");
 		if (signature === (this.serverMoveRemnantSignature ?? "")) return;
 		this.serverMoveRemnantSignature = signature;
 		if (signature) {
 			console.debug(`[VaultShare] ${this.path}: server-move leftovers kept out of the share: ${signature}`);
 		}
 		notifyWebFolderExclusionsChanged(this.path);
+	}
+
+	/**
+	 * An entry can stay bound to its old path inside a leftover root while the
+	 * share records its guid at the new path, which is already on disk (an
+	 * online client during a server move): it keeps syncing the stale copy and
+	 * requesting tokens for the old path. Point it at the recorded path, as
+	 * docAt() would; files on disk are not touched. Entries whose recorded
+	 * path is missing locally are left to the normal rename in scanFileTree().
+	 */
+	private rebindEntriesOutOfRemnants(roots: Set<string>): void {
+		const stale = [...(this.trackedEntries?.values() ?? [])].filter((entry) =>
+			isUnderSkippedPath(entry.entryPath, roots),
+		);
+		if (stale.length === 0) return;
+		const recordedPath = new Map<string, string>();
+		this.folderIndex.eachRecord((meta, path) => recordedPath.set(meta.id, path));
+		let moved = 0;
+		for (const entry of stale) {
+			const target = recordedPath.get(entry.entityGuid);
+			if (!target || target === entry.entryPath || isUnderSkippedPath(target, roots)) continue;
+			if (!this.hasFileSync(target)) continue;
+			console.debug(`[VaultShare] ${this.path}: re-bound ${entry.entityGuid} from ${entry.entryPath} to ${target} after a server move`);
+			entry.relocate(target, this);
+			moved++;
+		}
+		if (moved > 0) this.pathSet?.update();
 	}
 
 	/**
