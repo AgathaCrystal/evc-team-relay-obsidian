@@ -511,9 +511,23 @@
 	background: transparent;
 }
 
+/* One scroller on every platform. The panel's own wrapper
+   (SettingsPanel.svelte) reuses Obsidian's `.vertical-tab-content` class and
+   so inherits its overflow:auto; with the component's max-height it became a
+   second scroller inside Obsidian's outer one (two scrollbars on the plans
+   screen in Obsidian 1.15 desktop). Only Obsidian's outer container scrolls.
+   Obsidian also gives the class a fixed height; without `height: auto` the
+   content would spill past the panel's frame instead of growing it.
+   Padding/margin are left alone here; the mobile block below strips those. */
+.modal.mod-settings .vertical-tab-content .vertical-tab-content.vertical-tab-content {
+	height: auto;
+	max-height: none;
+	overflow: visible;
+}
+
 /* ------------------------------------------------------------------------
-   Mobile (Obsidian isMobile, ~393px) settings layout. Desktop is untouched:
-   every rule below is scoped under `.is-mobile`.
+   Mobile (Obsidian isMobile, ~393px) settings layout. Every rule below is
+   scoped under `.is-mobile`.
    ------------------------------------------------------------------------ */
 
 /* Obsidian's own mobile `.vertical-tab-content` padding/margin (and the

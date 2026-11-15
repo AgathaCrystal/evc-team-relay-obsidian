@@ -50,7 +50,7 @@ export const englishPhrasebook = {
 	"connect.login.orSignInWith": "Or sign in with:",
 	"connect.login.ssoUnavailableMobile":
 		"SSO sign-in isn't available on mobile yet — use the desktop app, or sign in with email and password if your account has one.",
-	"connect.login.successNotice": "Successfully logged in to relay-onprem!",
+	"connect.login.successNotice": "Successfully logged in!",
 	"connect.login.oauthSuccessNotice": "Successfully logged in with {provider}!",
 	"connect.login.loginFailedFallback": "Login failed",
 	"connect.login.incorrectCredentials": "Incorrect email or password",
@@ -85,7 +85,7 @@ export const englishPhrasebook = {
 	"shell.header.meshCta": "Mesh",
 	"shell.servers.heading": "Relay Servers",
 	"shell.servers.desc":
-		'Configure your relay-onprem servers. Click "Shares" to manage shares.',
+		'Configure your Team Relay servers. Click "Shares" to manage shares.',
 	"shell.breadcrumb.planUsage": "Plan & Usage",
 	"shell.breadcrumb.createInvite": "Create Invite",
 	"shell.breadcrumb.agentKeys": "Agent Keys",
@@ -346,6 +346,11 @@ export const englishPhrasebook = {
 	"billing.cancelSubscriptionButton": "Cancel",
 	"billing.currentPlanButton": "Current plan",
 	"billing.refreshButton": "Refresh",
+	// RU-only row under the payment buttons: the documents are
+	// Russian, so these English labels only show to an English-interface user
+	// on the RU deployment.
+	"billing.legal.offerLink": "Public offer",
+	"billing.legal.refundLink": "Refund and cancellation",
 
 	"billing.accessUntil": "Access until {date}",
 	"billing.usageTitle": "Your Usage",
@@ -556,7 +561,7 @@ export const ruPhrasebook = {
 	"connect.login.orSignInWith": "Или войдите через:",
 	"connect.login.ssoUnavailableMobile":
 		"Вход через SSO пока недоступен на мобильных устройствах — используйте настольное приложение или войдите с email и паролем, если они привязаны к вашей учётной записи.",
-	"connect.login.successNotice": "Вход в relay-onprem выполнен успешно!",
+	"connect.login.successNotice": "Вход выполнен успешно!",
 	"connect.login.oauthSuccessNotice": "Вход через {provider} выполнен успешно!",
 	"connect.login.loginFailedFallback": "Не удалось войти",
 	"connect.login.incorrectCredentials": "Неверный email или пароль",
@@ -588,7 +593,7 @@ export const ruPhrasebook = {
 	"shell.header.meshCta": "Mesh",
 	"shell.servers.heading": "Серверы Relay",
 	"shell.servers.desc":
-		"Настройте свои серверы relay-onprem. Нажмите «Общие доступы», чтобы управлять ими.",
+		"Настройте свои серверы Team Relay. Нажмите «Общие доступы», чтобы управлять ими.",
 	"shell.breadcrumb.planUsage": "Тариф и использование",
 	"shell.breadcrumb.createInvite": "Создать приглашение",
 	"shell.breadcrumb.agentKeys": "Ключи агента",
@@ -855,6 +860,8 @@ export const ruPhrasebook = {
 	"billing.cancelSubscriptionButton": "Отменить",
 	"billing.currentPlanButton": "Текущий тариф",
 	"billing.refreshButton": "Обновить",
+	"billing.legal.offerLink": "Оферта",
+	"billing.legal.refundLink": "Возврат и отмена",
 
 	"billing.accessUntil": "Доступ до {date}",
 	"billing.usageTitle": "Использование",

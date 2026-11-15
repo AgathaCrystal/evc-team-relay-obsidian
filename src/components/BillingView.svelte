@@ -7,6 +7,7 @@
 	import { resolveCurrentPlanId } from "../billing/currentPlan";
 	import { BYTE_VALUED_ENTITLEMENTS, classifyEntitlement } from "../billing/entitlements";
 	import { formatAmount } from "../billing/money";
+	import { legalLinksFor } from "../billing/legalLinks";
 	import { isOpenableUrl } from "../billing/openableUrl";
 	import { selectDisplayPrice } from "../billing/planPrice";
 	import { uiText } from "../wording/uiText";
@@ -266,6 +267,11 @@
 	$: isFree = billingData?.plan === "free" || billingData?.plan === "Free" || billingData?.plan === "Relay Free";
 	$: hasSub = billingData?.subscription !== null && billingData?.subscription !== undefined;
 	$: currentPlanId = resolveCurrentPlanId(billingData, availablePlans);
+	$: legalLinks = legalLinksFor(availablePlans);
+
+	function openLegalLink(url: string) {
+		if (isOpenableUrl(url)) window.open(url);
+	}
 	$: isCancelled = billingData?.subscription?.cancel_at_period_end === true || billingData?.subscription?.status === "cancelled";
 </script>
 
@@ -398,6 +404,18 @@
 					</div>
 				{/each}
 			</div>
+			{#if legalLinks.length > 0}
+				<div class="evc-legal-links">
+					{#each legalLinks as link, i}
+						{#if i > 0}<span class="evc-legal-sep" aria-hidden="true">·</span>{/if}
+						<a
+							href={link.url}
+							class="evc-legal-link"
+							on:click|preventDefault={() => openLegalLink(link.url)}
+						>{uiText(link.labelKey)}</a>
+					{/each}
+				</div>
+			{/if}
 		{/if}
 
 		{#if checkoutComingSoon}
@@ -563,13 +581,22 @@
 		font-size: 0.85em;
 	}
 
+	/* The explicit min-width replaced flex's content-based minimum, so in a
+	   narrow card the value shrank to 50px and "Включено" ran over the label
+	   ("Закрывающие документы (ЭДО)"). The value keeps its content
+	   width; the label takes the rest and wraps. */
 	.evc-feature-value {
 		font-weight: 600;
 		min-width: 50px;
+		flex: 0 0 auto;
+		white-space: nowrap;
 	}
 
 	.evc-feature-label {
 		color: var(--text-muted);
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 
 	.evc-plan-action {
@@ -634,6 +661,21 @@
 		font-size: 0.8em;
 		color: var(--text-muted);
 	}
+
+	.evc-legal-links {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		font-size: 0.8em;
+		color: var(--text-muted);
+	}
+
+	.evc-legal-link {
+		color: var(--text-muted);
+		text-decoration: underline;
+	}
+
+	.evc-legal-link:hover { color: var(--text-normal); }
 
 	/* Reads as a state, not a failure: muted text, no error colouring. */
 	.evc-checkout-note {
