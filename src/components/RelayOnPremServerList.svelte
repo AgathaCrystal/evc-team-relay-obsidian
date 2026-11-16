@@ -20,6 +20,7 @@
 	import { confirmDialog } from "../ui/dialogs";
 	import evcLogo from "../assets/evc-logo.png";
 	import { uiText } from "../wording/uiText";
+	import type { ServerCapabilities } from "../serverInfoCache";
 
 	export let live: TeamRelayPlugin;
 
@@ -72,12 +73,38 @@
 		entry.controller.abort();
 	}
 
-	// Track which servers support billing (enterprise + billing_enabled)
-	let serverBillingSupport: Record<string, boolean> = {};
+	// Billing support (enterprise + billing_enabled) and branding logo per server, from
+	// /v1/server/info. The plugin keeps them across mounts: this list is mounted again on
+	// every return to it, and a slow answer used to insert Plan & Usage under the cursor.
+	const serverInfoCache = live.serverInfoCache;
+	// Bumped when an answer arrives, so rows read the cache again.
+	let serverInfoVersion = 0;
+	// Per server (id + control plane URL): whether its row got a Plan & Usage slot when
+	// it was first drawn in this mount. A slot, once drawn, stays until the list closes.
+	// Plain map, read during render only.
+	const billingSlotDrawn = new Map<string, boolean>();
 
-	// Per-server branding logo: the server's own logo_url, and whether it failed to load
-	// (a server with no branding, or an unreachable image, falls back to evcLogo below).
-	let serverLogoUrl: Record<string, string | undefined> = {};
+	function capabilitiesOf(server: RelayOnPremServer, _version: number): ServerCapabilities | undefined {
+		return serverInfoCache.peek(server);
+	}
+
+	// The row keeps one shape for the whole mount, whatever the answer:
+	// - "none": known before the row was drawn that the server has no billing; no slot;
+	// - "pending": no answer yet, or the request failed; drawn disabled;
+	// - "ready": billing; drawn enabled (when logged in);
+	// - "reserved": the answer "no billing" came after the row was drawn; the slot
+	//   stays, invisible and inert, so nothing after it moves.
+	function billingSlot(server: RelayOnPremServer, version: number): "ready" | "pending" | "reserved" | "none" {
+		const capabilities = capabilitiesOf(server, version);
+		const key = `${server.id}\u0000${server.controlPlaneUrl}`;
+		if (!billingSlotDrawn.has(key)) billingSlotDrawn.set(key, capabilities?.billing !== false);
+		if (!billingSlotDrawn.get(key)) return "none";
+		if (!capabilities) return "pending";
+		return capabilities.billing ? "ready" : "reserved";
+	}
+
+	// Per-server branding logo failure (a server with no branding, or an unreachable
+	// image, falls back to evcLogo below).
 	let serverLogoFailed: Record<string, boolean> = {};
 
 	function handleServerLogoError(serverId: string) {
@@ -104,23 +131,17 @@
 		dispatch("serversChanged");
 	}
 
-	// Check billing support for all servers on load
-	async function checkBillingSupport() {
-		for (const s of servers) {
-			if (serverBillingSupport[s.id] !== undefined) continue;
-			const info = await fetchServerInfo(s.controlPlaneUrl);
-			if (info) {
-				serverBillingSupport[s.id] = info.edition === "enterprise" && info.features?.billing_enabled === true;
-				serverBillingSupport = serverBillingSupport; // trigger reactivity
-				serverLogoUrl[s.id] = info.branding?.logo_url;
-				serverLogoUrl = serverLogoUrl; // trigger reactivity
-			}
-		}
+	// Ask every server that has not answered yet, all at once. The cache shares one
+	// request per server between mounts and drops failures, so a later mount asks again.
+	async function loadServerInfo(list: RelayOnPremServer[]) {
+		await Promise.all(list.map(async (s) => {
+			if (serverInfoCache.peek(s)) return;
+			if (await serverInfoCache.load(s, fetchServerInfo)) serverInfoVersion = serverInfoVersion + 1;
+		}));
 	}
 
-	// Run on component init
-	import { onMount } from "svelte";
-	onMount(() => { checkBillingSupport(); });
+	// Also covers a server added or edited while the list is open.
+	$: void loadServerInfo(servers);
 
 	function startAddServer() {
 		isAddingServer = true;
@@ -373,7 +394,8 @@
 
 		// Track billing support for this server
 		if (serverInfo) {
-			serverBillingSupport[server.id] = serverInfo.edition === "enterprise" && serverInfo.features?.billing_enabled === true;
+			serverInfoCache.remember(server, serverInfo);
+			serverInfoVersion = serverInfoVersion + 1;
 		}
 
 		// If OAuth is enabled, try OAuth-first flow. OAuthCallbackServer
@@ -499,9 +521,11 @@
 
 	{#each servers as server (server.id)}
 		{@const authStatus = getAuthStatus(server.id, authRefreshKey)}
+		{@const logoUrl = capabilitiesOf(server, serverInfoVersion)?.logoUrl}
+		{@const billing = billingSlot(server, serverInfoVersion)}
 		<div class="relay-server-item" class:is-default={server.id === defaultServerId}>
 			<img
-				src={serverLogoUrl[server.id] && !serverLogoFailed[server.id] ? serverLogoUrl[server.id] : evcLogo}
+				src={logoUrl && !serverLogoFailed[server.id] ? logoUrl : evcLogo}
 				alt=""
 				class="relay-server-logo"
 				on:error={() => handleServerLogoError(server.id)}
@@ -561,12 +585,15 @@
 				>
 					{uiText("serverList.sharesButton")}
 				</button>
-				{#if serverBillingSupport[server.id]}
+				{#if billing !== "none"}
 					<button
 						class="relay-server-btn"
+						class:relay-server-btn-reserved={billing === "reserved"}
 						on:click={() => dispatch('openBilling', { server })}
-						disabled={!authStatus.isLoggedIn}
-						title={authStatus.isLoggedIn ? undefined : uiText("serverList.loginRequiredHint")}
+						disabled={!authStatus.isLoggedIn || billing !== "ready"}
+						aria-hidden={billing === "reserved" ? "true" : undefined}
+						tabindex={billing === "reserved" ? -1 : undefined}
+						title={authStatus.isLoggedIn || billing === "reserved" ? undefined : uiText("serverList.loginRequiredHint")}
 					>
 						{uiText("shell.breadcrumb.planUsage")}
 					</button>
@@ -782,6 +809,12 @@
 	.relay-server-btn:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	/* Plan & Usage of a server that turned out to have no billing while the list was
+	   open: keeps its place so the buttons after it do not move. */
+	.relay-server-btn-reserved {
+		visibility: hidden;
 	}
 
 	.relay-server-form {

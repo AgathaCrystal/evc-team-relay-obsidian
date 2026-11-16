@@ -129,6 +129,7 @@ import { VaultScopedMap } from "./VaultScopedMap";
 import { collectWebFolderItems, isRootSharePath, joinFolderPath, resolveShareFolder } from "./vaultRootPath";
 import { FolderShareTracker } from "./FolderShareTracker";
 import { openSettingsAt } from "./settingsNavigation";
+import { ServerInfoCache } from "./serverInfoCache";
 
 interface LoggingSettings {
 	debugging: boolean;
@@ -229,6 +230,8 @@ export default class TeamRelayPlugin extends Plugin {
 	// Auth + settings UI
 	authSession!: AuthSession;
 	settingsPage!: RelaySettingsPage;
+	// /v1/server/info answers for the server list, kept across its mounts.
+	readonly serverInfoCache = new ServerInfoCache();
 	pluginSettings!: Settings<StoredSettings>;
 
 	// Persisted-settings namespaces
