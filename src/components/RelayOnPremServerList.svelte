@@ -20,6 +20,7 @@
 	import { confirmDialog } from "../ui/dialogs";
 	import evcLogo from "../assets/evc-logo.png";
 	import { uiText } from "../wording/uiText";
+	import type { ServerCapabilities } from "../serverInfoCache";
 
 	export let live: TeamRelayPlugin;
 
@@ -72,12 +73,29 @@
 		entry.controller.abort();
 	}
 
-	// Track which servers support billing (enterprise + billing_enabled)
-	let serverBillingSupport: Record<string, boolean> = {};
+	// Billing support (enterprise + billing_enabled) and branding logo per server, from
+	// /v1/server/info. The plugin keeps them across mounts: this list is mounted again on
+	// every return to it, and a slow answer used to insert Plan & Usage under the cursor.
+	const serverInfoCache = live.serverInfoCache;
+	// Bumped when an answer arrives, so rows read the cache again.
+	let serverInfoVersion = 0;
+	// Servers whose info request failed during this mount: no Plan & Usage for them.
+	let serverInfoFailed: Record<string, boolean> = {};
 
-	// Per-server branding logo: the server's own logo_url, and whether it failed to load
-	// (a server with no branding, or an unreachable image, falls back to evcLogo below).
-	let serverLogoUrl: Record<string, string | undefined> = {};
+	function capabilitiesOf(server: RelayOnPremServer, _version: number): ServerCapabilities | undefined {
+		return serverInfoCache.peek(server);
+	}
+
+	// A server that has not answered yet keeps the Plan & Usage slot (disabled), so the
+	// row does not change shape when the answer arrives.
+	function billingSlot(server: RelayOnPremServer, version: number): "ready" | "pending" | "none" {
+		const capabilities = capabilitiesOf(server, version);
+		if (capabilities) return capabilities.billing ? "ready" : "none";
+		return serverInfoFailed[server.id] ? "none" : "pending";
+	}
+
+	// Per-server branding logo failure (a server with no branding, or an unreachable
+	// image, falls back to evcLogo below).
 	let serverLogoFailed: Record<string, boolean> = {};
 
 	function handleServerLogoError(serverId: string) {
@@ -104,23 +122,19 @@
 		dispatch("serversChanged");
 	}
 
-	// Check billing support for all servers on load
-	async function checkBillingSupport() {
-		for (const s of servers) {
-			if (serverBillingSupport[s.id] !== undefined) continue;
-			const info = await fetchServerInfo(s.controlPlaneUrl);
-			if (info) {
-				serverBillingSupport[s.id] = info.edition === "enterprise" && info.features?.billing_enabled === true;
-				serverBillingSupport = serverBillingSupport; // trigger reactivity
-				serverLogoUrl[s.id] = info.branding?.logo_url;
-				serverLogoUrl = serverLogoUrl; // trigger reactivity
-			}
-		}
+	// Ask every server that has not answered yet, all at once. The cache shares one
+	// request per server between mounts and drops failures, so a later mount asks again.
+	async function loadServerInfo(list: RelayOnPremServer[]) {
+		await Promise.all(list.map(async (s) => {
+			if (serverInfoCache.peek(s)) return;
+			const capabilities = await serverInfoCache.load(s, fetchServerInfo);
+			serverInfoFailed = { ...serverInfoFailed, [s.id]: capabilities === null };
+			serverInfoVersion = serverInfoVersion + 1;
+		}));
 	}
 
-	// Run on component init
-	import { onMount } from "svelte";
-	onMount(() => { checkBillingSupport(); });
+	// Also covers a server added or edited while the list is open.
+	$: void loadServerInfo(servers);
 
 	function startAddServer() {
 		isAddingServer = true;
@@ -373,7 +387,9 @@
 
 		// Track billing support for this server
 		if (serverInfo) {
-			serverBillingSupport[server.id] = serverInfo.edition === "enterprise" && serverInfo.features?.billing_enabled === true;
+			serverInfoCache.remember(server, serverInfo);
+			serverInfoFailed = { ...serverInfoFailed, [server.id]: false };
+			serverInfoVersion = serverInfoVersion + 1;
 		}
 
 		// If OAuth is enabled, try OAuth-first flow. OAuthCallbackServer
@@ -499,9 +515,11 @@
 
 	{#each servers as server (server.id)}
 		{@const authStatus = getAuthStatus(server.id, authRefreshKey)}
+		{@const logoUrl = capabilitiesOf(server, serverInfoVersion)?.logoUrl}
+		{@const billing = billingSlot(server, serverInfoVersion)}
 		<div class="relay-server-item" class:is-default={server.id === defaultServerId}>
 			<img
-				src={serverLogoUrl[server.id] && !serverLogoFailed[server.id] ? serverLogoUrl[server.id] : evcLogo}
+				src={logoUrl && !serverLogoFailed[server.id] ? logoUrl : evcLogo}
 				alt=""
 				class="relay-server-logo"
 				on:error={() => handleServerLogoError(server.id)}
@@ -561,11 +579,11 @@
 				>
 					{uiText("serverList.sharesButton")}
 				</button>
-				{#if serverBillingSupport[server.id]}
+				{#if billing !== "none"}
 					<button
 						class="relay-server-btn"
 						on:click={() => dispatch('openBilling', { server })}
-						disabled={!authStatus.isLoggedIn}
+						disabled={!authStatus.isLoggedIn || billing === "pending"}
 						title={authStatus.isLoggedIn ? undefined : uiText("serverList.loginRequiredHint")}
 					>
 						{uiText("shell.breadcrumb.planUsage")}

@@ -10,6 +10,7 @@ const addServer = jest.fn();
 const mutateValue = jest.fn();
 import { loadSvelteComponent } from "../scripts/test/svelteDOM.cjs";
 import { testGlobal } from "./mocks/testGlobal";
+import { ServerInfoCache } from "../src/serverInfoCache";
 
 let Component: SvelteComponentType<Record<string, unknown>>;
 let mountComponent: typeof import("../src/svelteMount").mountComponent;
@@ -60,7 +61,8 @@ function mount(servers: RelayOnPremServer[] = []) {
 	});
 	component = mountComponent(Component, { target: document.body, props: {
 		live: { relayOnPremSettings: { subscribe, mutateValue },
-			authSession: { addServer, updateServer: jest.fn(), isLoggedInToServer: () => false } },
+			authSession: { addServer, updateServer: jest.fn(), isLoggedInToServer: () => false },
+			serverInfoCache: new ServerInfoCache() },
 	} });
 }
 
