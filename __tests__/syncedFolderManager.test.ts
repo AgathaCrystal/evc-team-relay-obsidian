@@ -37,13 +37,25 @@ afterEach(() => {
 	(obsidian.getLanguage as jest.Mock).mockReturnValue("en");
 });
 
-function mount(language: string, opts: { folderMissing: boolean; stuck?: string[]; pending?: number }) {
+interface MountOptions {
+	folderMissing: boolean;
+	stuck?: string[];
+	pending?: number;
+	// A share on a Relay server has a workspace id: "relay-onprem" for an
+	// on-prem share (main.ts creates them so). Undefined = local-only record.
+	workspaceId?: string | null;
+	accessDenied?: boolean;
+}
+
+function mount(language: string, opts: MountOptions) {
 	(obsidian.getLanguage as jest.Mock).mockReturnValue(language);
 	const stuck = opts.stuck ?? [];
 	const syncedFolder = {
 		path: "Проекты/Общая",
 		folderLabel: "Общая",
 		folderMissing: opts.folderMissing,
+		workspaceId: opts.workspaceId === null ? undefined : (opts.workspaceId ?? "relay-onprem"),
+		accessDenied: opts.accessDenied ?? false,
 		pendingUploadCount: () => opts.pending ?? stuck.length,
 		stuckUploadPaths: () => stuck,
 		retryPendingUploads: async () => undefined,
@@ -101,7 +113,6 @@ describe("synced folder page in Russian", () => {
 		const text = mount("ru", { folderMissing: false, stuck: ["a.png", "b.png"], pending: 5 });
 		// "Relay" is the product name and stays Latin; nothing else may.
 		expect(text.replace(/Relay/g, "")).not.toMatch(/[A-Za-z]{3,}/);
-		expect(text).toContain("Этот общий доступ не размещён на сервере Relay");
 		expect(text).toContain("Файлы не загружены");
 		expect(text).toContain("Файлов не загружено дольше 7 дней: 2");
 		expect(text).toContain("Ещё файлов ждут загрузки: 3");
@@ -113,6 +124,48 @@ describe("synced folder page in Russian", () => {
 		const text = mount("ru", { folderMissing: false, pending: 4 });
 		expect(text).toContain("Не загружено файлов: 4.");
 		expect(text).not.toContain("not uploaded yet");
+	});
+});
+
+const NOT_ON_SERVER_EN = "This Shared Folder is not on a Relay Server";
+const NOT_ON_SERVER_RU = "Этот общий доступ не размещён на сервере Relay";
+
+describe("'not on a Relay Server' banner", () => {
+	test("connected on-prem share with access and stuck files: no banner, Files not uploaded block shown", () => {
+		const text = mount("en", { folderMissing: false, stuck: ["a.png"], pending: 1 });
+		expect(text).not.toContain(NOT_ON_SERVER_EN);
+		expect(text).toContain("Files not uploaded");
+		expect(text).toContain("1 file not uploaded for more than 7 days");
+	});
+
+	test("connected cloud share with access: no banner", () => {
+		const text = mount("en", { folderMissing: false, workspaceId: "0b6f4c1e-relay-guid" });
+		expect(text).not.toContain(NOT_ON_SERVER_EN);
+	});
+
+	test("connected on-prem share in Russian: no banner, Файлы не загружены shown", () => {
+		const text = mount("ru", { folderMissing: false, stuck: ["a.png"], pending: 1 });
+		expect(text).not.toContain(NOT_ON_SERVER_RU);
+		expect(text).toContain("Файлы не загружены");
+	});
+
+	test("share without a relay: banner shown", () => {
+		const text = mount("en", { folderMissing: false, workspaceId: null });
+		expect(text).toContain(NOT_ON_SERVER_EN);
+	});
+
+	test("share the server refuses (401/403): banner shown, in Russian too", () => {
+		expect(mount("en", { folderMissing: false, accessDenied: true })).toContain(NOT_ON_SERVER_EN);
+		component?.destroy();
+		expect(mount("ru", { folderMissing: false, accessDenied: true })).toContain(NOT_ON_SERVER_RU);
+	});
+
+	test("missing folder: no banner, even without a relay or access", () => {
+		expect(mount("en", { folderMissing: true })).not.toContain(NOT_ON_SERVER_EN);
+		component?.destroy();
+		expect(
+			mount("en", { folderMissing: true, workspaceId: null, accessDenied: true }),
+		).not.toContain(NOT_ON_SERVER_EN);
 	});
 });
 

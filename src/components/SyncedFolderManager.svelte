@@ -32,6 +32,12 @@
 	}
 
 	const folderMissing = syncedFolder ? syncedFolder.folderMissing : false;
+	// The banner is for a share the page cannot reach: no Relay server behind
+	// it (no workspace id, a local-only record) or the server refuses its token
+	// (401/403). A connected share with access -- on-prem ("relay-onprem") or
+	// cloud -- has neither, and a missing folder has its own section instead.
+	const notOnServer =
+		!!syncedFolder && !folderMissing && (!syncedFolder.workspaceId || syncedFolder.accessDenied);
 	let pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
 	let stuckPaths: string[] = syncedFolder ? syncedFolder.stuckUploadPaths() : [];
 	$: notice = uploadNotice(pendingUploads, stuckPaths.length);
@@ -97,8 +103,7 @@
 
 <NavTrail waypoints={crumbs} />
 
-<!-- Off for a missing folder: the share is fine, its folder is what is gone. -->
-{#if !folderMissing}
+{#if notOnServer}
 	<div style={NOTICE_WRAPPER_STYLE}>
 		<p style={NOTICE_TEXT_STYLE}>{uiText("syncedFolder.notOnServer")}</p>
 	</div>
