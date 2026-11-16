@@ -160,25 +160,67 @@ describe("server list keeps its buttons in place while /v1/server/info is slow",
 		expect(serverInfoCalls().sort()).toEqual([`${EVC_CP_URL}/v1/server/info`, `${TR_RU_CP_URL}/v1/server/info`].sort());
 	});
 
-	test("a server without billing has no Plan & Usage once it answered; a failed answer is asked again next time", async () => {
+	test.each([
+		["no billing", (held: { answer: (body: unknown) => void }) => held.answer(COMMUNITY_INFO)],
+		["request failed", (held: { fail: () => void }) => held.fail()],
+	])("%s: both rows keep the same buttons, in the same order, before and after the answer", async (_case, settle) => {
+		mount([ENTIRE, RU], new ServerInfoCache());
+		await flush();
+		const before = [rowButtons(0), rowButtons(1)];
+		const beforeLabels = [labels(0), labels(1)];
+		// Settle every request, including ones started after an earlier answer.
+		for (let i = 0; i < heldInfo.length; i++) {
+			settle(heldInfo[i] as never);
+			await flush();
+		}
+		expect(heldInfo).toHaveLength(2);
+		expect([labels(0), labels(1)]).toEqual(beforeLabels);
+		expect([rowButtons(0), rowButtons(1)]).toEqual(before);
+		for (const row of [0, 1]) {
+			for (const [i, button] of rowButtons(row).entries()) expect(button).toBe(before[row][i]);
+			const plan = rowButtons(row).find((b) => b.textContent!.trim() === "Тариф и использование")!;
+			expect(plan.disabled).toBe(true);
+		}
+	});
+
+	test("no billing: the kept slot is invisible and inert; next time the row is drawn without it", async () => {
 		const cache = new ServerInfoCache();
-		mount([ENTIRE, RU], cache);
+		mount([ENTIRE], cache);
 		await flush();
-		heldInfo.find((h) => h.url.startsWith(EVC_CP_URL))!.answer(COMMUNITY_INFO);
+		heldInfo[0].answer(COMMUNITY_INFO);
 		await flush();
-		heldInfo.find((h) => h.url.startsWith(TR_RU_CP_URL))!.fail();
-		await flush();
-		expect(labels(0)).not.toContain("Тариф и использование");
-		expect(labels(1)).not.toContain("Тариф и использование");
+		const plan = rowButtons(0).find((b) => b.textContent!.trim() === "Тариф и использование")!;
+		expect(plan.classList.contains("relay-server-btn-reserved")).toBe(true);
+		expect(plan.getAttribute("aria-hidden")).toBe("true");
+		expect(plan.tabIndex).toBe(-1);
+		expect(plan.disabled).toBe(true);
 		unmount();
 
-		mount([ENTIRE, RU], cache);
-		expect(labels(0)).not.toContain("Тариф и использование");
-		// RU never answered: its slot is reserved again while it is asked once more.
-		expect(labels(1)).toContain("Тариф и использование");
+		mount([ENTIRE], cache);
+		const firstPaint = labels(0);
+		expect(firstPaint).not.toContain("Тариф и использование");
 		await flush();
-		expect(serverInfoCalls().filter((url) => url.startsWith(TR_RU_CP_URL))).toHaveLength(2);
-		expect(serverInfoCalls().filter((url) => url.startsWith(EVC_CP_URL))).toHaveLength(1);
+		expect(labels(0)).toEqual(firstPaint);
+		expect(serverInfoCalls()).toHaveLength(1);
+	});
+
+	test("request failed: the next opening keeps the slot (disabled) and asks again", async () => {
+		const cache = new ServerInfoCache();
+		mount([RU], cache);
+		await flush();
+		heldInfo[0].fail();
+		await flush();
+		unmount();
+
+		mount([RU], cache);
+		const firstPaint = labels(0);
+		expect(firstPaint).toContain("Тариф и использование");
+		await flush();
+		expect(serverInfoCalls()).toHaveLength(2);
+		heldInfo[1].answer(BILLING_INFO);
+		await flush();
+		expect(labels(0)).toEqual(firstPaint);
+		expect(rowButtons(0).find((b) => b.textContent!.trim() === "Тариф и использование")!.disabled).toBe(false);
 	});
 
 	test("logged-out server keeps Shares, Plan & Usage and Agent Keys disabled with the login hint", async () => {
