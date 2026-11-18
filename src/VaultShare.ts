@@ -66,8 +66,13 @@ import { buildConflictCopyPath, isConflictCopyPath } from "./conflictCopyPath";
 import { partitionByKnownGuid } from "./mintGate";
 import { DocActivityChannel } from "./docActivity";
 import {
+	notifyWebFolderExclusionsChanged,
+	registerWebFolderExclusion,
+} from "./webFolderExclusions";
+import {
 	findServerMoves,
 	findStructuralMoves,
+	isRelocatableRoot,
 	isUnderSkippedPath,
 	takeRecordSnapshot,
 	type RecordSnapshot,
@@ -297,6 +302,7 @@ export class VaultShare extends ProviderBacked {
 		// every one of them would look unfulfillable and be dropped.
 		if (!this.dormant) this._settleUploadClaims();
 		this._wireSyncStoreListener();
+		this.teardowns.push(registerWebFolderExclusion(this));
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
 		this.rootRelative = withRootRelativePaths(this, this.path, (globalPath: string) => {
@@ -728,6 +734,7 @@ export class VaultShare extends ProviderBacked {
 						const persisted = await this.recordsBeforeSync();
 						await this.onceFreshlySynced();
 						await this.applyServerMoves(persisted);
+						this.refreshServerMoveRemnants();
 					}
 					return !this.isTornDown;
 				})(),
@@ -782,6 +789,97 @@ export class VaultShare extends ProviderBacked {
 				console.warn(`[VaultShare] ${this.path}: could not follow server move ${from} -> ${to}`, e);
 			}
 		}
+	}
+
+	/**
+	 * Top-level roots that are leftovers of a server move and must stay out of
+	 * the share and its web index: roots skipped at startup, plus, for a client
+	 * that was online during the move, every tool-named root the share no
+	 * longer tracks while `artifacts/<root>` is a tracked folder. The live check
+	 * matters because applyServerMoves() only runs once per start, so an online
+	 * client never fills followedMoveSkips.
+	 */
+	serverMoveRemnantRoots(): Set<string> {
+		const roots = new Set<string>(this.followedMoveSkips);
+		if (this.isTornDown || !this.folderIndex) return roots;
+		let candidates: string[] = [];
+		try {
+			candidates = this.vaultFilesInScope()
+				.filter((file) => file instanceof TFolder)
+				.map((folder) => this.toVirtualPath(folder.path))
+				.filter((vpath) => !vpath.includes("/") && isRelocatableRoot(vpath));
+		} catch {
+			// No on-disk folder yet: nothing local can be a leftover.
+		}
+		if (candidates.length === 0) return roots;
+		for (const move of findStructuralMoves(candidates, takeRecordSnapshot(this.folderIndex))) {
+			roots.add(move.from);
+		}
+		return roots;
+	}
+
+	/** webFolderExclusions source: hides server-move leftovers from web_folder_items. */
+	webFolderExclusion(): ((vaultPath: string) => boolean) | null {
+		const roots = this.serverMoveRemnantRoots();
+		if (roots.size === 0) return null;
+		return (vaultPath) =>
+			this.containsPath(vaultPath) && isUnderSkippedPath(this.toVirtualPath(vaultPath), roots);
+	}
+
+	private serverMoveRemnantSignature = "";
+
+	/**
+	 * Re-publish the web index when the set of leftovers changes. The PATCH
+	 * that raced the move already listed them, and nothing else on disk
+	 * changes afterwards to trigger another one.
+	 */
+	private refreshServerMoveRemnants(): void {
+		if (this.isTornDown) return;
+		const roots = this.serverMoveRemnantRoots();
+		if (roots.size > 0) this.rebindEntriesOutOfRemnants(roots);
+		const signature = [...roots].sort().join(", ");
+		if (signature === (this.serverMoveRemnantSignature ?? "")) return;
+		this.serverMoveRemnantSignature = signature;
+		if (signature) {
+			console.debug(`[VaultShare] ${this.path}: server-move leftovers kept out of the share: ${signature}`);
+		}
+		notifyWebFolderExclusionsChanged(this.path);
+	}
+
+	/**
+	 * An entry can stay bound to its old path inside a leftover root while the
+	 * share records its guid at the new path, which is already on disk (an
+	 * online client during a server move): it keeps syncing the stale copy and
+	 * requesting tokens for the old path. Point it at the recorded path, as
+	 * docAt() would; files on disk are not touched. Entries whose recorded
+	 * path is missing locally are left to the normal rename in scanFileTree().
+	 *
+	 * Only documents and canvases are re-bound: their cached TFile is dropped
+	 * so the next save resolves the recorded path. relocate() keeps that cache
+	 * because on an ordinary rename Obsidian moves the same TFile object; here
+	 * the old copy stays on disk and the cache would keep writing into it.
+	 * Attachments and folders hold their own path-bound state and are left as
+	 * they are.
+	 */
+	private rebindEntriesOutOfRemnants(roots: Set<string>): void {
+		const stale = [...(this.trackedEntries?.values() ?? [])].filter(
+			(entry): entry is Document | CanvasDocument =>
+				(isDocument(entry) || isCanvasDocument(entry)) && isUnderSkippedPath(entry.entryPath, roots),
+		);
+		if (stale.length === 0) return;
+		const recordedPath = new Map<string, string>();
+		this.folderIndex.eachRecord((meta, path) => recordedPath.set(meta.id, path));
+		let moved = 0;
+		for (const entry of stale) {
+			const target = recordedPath.get(entry.entityGuid);
+			if (!target || target === entry.entryPath || isUnderSkippedPath(target, roots)) continue;
+			if (!this.hasFileSync(target)) continue;
+			console.debug(`[VaultShare] ${this.path}: re-bound ${entry.entityGuid} from ${entry.entryPath} to ${target} after a server move`);
+			entry.relocate(target, this);
+			entry._obsidianFile = null;
+			moved++;
+		}
+		if (moved > 0) this.pathSet?.update();
 	}
 
 	/**
@@ -862,9 +960,10 @@ export class VaultShare extends ProviderBacked {
 		let syncTFiles = this.vaultFilesInScope().filter(
 			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
 		);
-		if (this.followedMoveSkips.size > 0) {
+		const remnants = this.serverMoveRemnantRoots();
+		if (remnants.size > 0) {
 			syncTFiles = syncTFiles.filter(
-				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), this.followedMoveSkips),
+				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), remnants),
 			);
 		}
 		if (!allowMint) {
@@ -2132,6 +2231,7 @@ export class VaultShare extends ProviderBacked {
 				if (renames.length > 0 || creates.length > 0 || deletes.length > 0) {
 					this.pathSet.update();
 				}
+				this.refreshServerMoveRemnants();
 			} finally {
 				// Clear the in-flight marker whether this pass succeeded or threw.
 				this.treeScanInFlight = null;
