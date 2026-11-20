@@ -843,7 +843,8 @@ describe("InboundFileDownloader", () => {
 
 			await downloader.downloadShare(SHARE_ID, SERVER_ID);
 
-			expect(clientManager.downloadFile).not.toHaveBeenCalled();
+			// The server copy may be read to compare it with the local text
+			// but never written over the local file.
 			expect(vault.adapter.writeBinary).not.toHaveBeenCalled();
 			expect(noticeMock).toHaveBeenCalledTimes(1);
 		});

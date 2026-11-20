@@ -792,7 +792,7 @@ export default class TeamRelayPlugin extends Plugin {
 			// Outbound mirror of local edits into the sync protocol.
 			// Shares the downloader's base store: "the version this client
 			// pulled" is exactly what If-Match may replace.
-			const { createOutboundSyncWriter, watchShareReconnects } = await import(
+			const { createOutboundSyncWriter, readRelaySyncedText, watchShareReconnects } = await import(
 				"./outboundSyncWiring"
 			);
 			this.outboundSyncWriter = createOutboundSyncWriter({
@@ -805,6 +805,12 @@ export default class TeamRelayPlugin extends Plugin {
 			const outboundWriter = this.outboundSyncWriter;
 			this.inboundFileDownloader.setPassListener((shareId) =>
 				outboundWriter.onInboundPass(shareId),
+			);
+			// Tells a conflict whose local text is the shared live note apart
+			// from a local edit.
+			this.inboundFileDownloader.setRelayTextProbe(
+				async (vaultPath) =>
+					(await readRelaySyncedText(this.app.vault, this.shareRegistry, vaultPath)) !== null,
 			);
 			this.app.workspace.onLayoutReady(() => {
 				if (this.outboundSyncWriter !== outboundWriter) return;
