@@ -24,19 +24,25 @@ jest.mock("src/logging", () => ({
 }));
 
 import {
+	DELETE_MAX_ATTEMPTS,
 	MIN_WRITE_INTERVAL_MS,
 	NOT_SYNCED_RETRY_MS,
 	OUTBOUND_DEBOUNCE_MS,
 	OutboundSyncWriter,
+	TRANSIENT_RETRY_MS,
+	decideOutboundDelete,
 	decideOutboundWrite,
 	type OutboundDecision,
+	type OutboundDeleteDecision,
 	type OutboundTarget,
 	type ServerSyncItem,
 	type SyncWritePrecondition,
 } from "src/OutboundSyncWriter";
 import { InboundFileDownloader } from "src/InboundFileDownloader";
+import { isLocalRemoval } from "src/localRemoval";
+import type { ShareRegistry } from "src/VaultShare";
 import { RelayHttpError } from "src/relayRequestErrors";
-import type { FileManager, Vault } from "obsidian";
+import type { Vault } from "obsidian";
 
 const flushPromises = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
@@ -145,17 +151,38 @@ class FakeServer {
 		this.put(path, content, "crdt");
 		return { sha256: sha(content) };
 	}
+
+	deletes: Array<{ path: string; ifMatch: string; at: number }> = [];
+
+	delete(path: string, ifMatch: string): void {
+		const hook = this.beforeWrite;
+		this.beforeWrite = null;
+		hook?.();
+		if (this.failNext) {
+			const err = this.failNext;
+			this.failNext = null;
+			throw err;
+		}
+		const current = this.items.get(path);
+		if (!current) throw new RelayHttpError(404, "Failed to delete file: 404");
+		if (current.sha256 !== ifMatch) throw new RelayHttpError(412, "Failed to delete file: 412");
+		this.deletes.push({ path, ifMatch, at: this.clock.now() });
+		this.items.delete(path);
+	}
 }
 
 const SHARE = "share-1";
 const SERVER = "server-1";
 const FOLDER = "Shared";
 
-function setup(opts: { capable?: boolean } = {}) {
+function setup(opts: { capable?: boolean; deleteCapable?: boolean } = {}) {
 	const clock = new FakeClock();
 	const server = new FakeServer(clock);
 	const disk = new Map<string, string>(); // vault path -> synced text (absent = not synced yet)
 	const baseStore = new Map<string, Record<string, string>>();
+	/** The next N files-index / server-info reads fail like a dropped connection. */
+	const faults = { index: 0, info: 0 };
+	const offline = (): Error => new Error("net::ERR_INTERNET_DISCONNECTED");
 	const writer = new OutboundSyncWriter({
 		clock,
 		baseStore,
@@ -165,12 +192,27 @@ function setup(opts: { capable?: boolean } = {}) {
 				: null,
 		readSyncedText: async (vaultPath) => disk.get(vaultPath) ?? null,
 		supportsSyncOrigin: async () => opts.capable ?? true,
-		getFilesIndex: async () => server.index(),
+		getFilesIndex: async () => {
+			if (faults.index > 0) {
+				faults.index--;
+				throw offline();
+			}
+			return server.index();
+		},
 		syncWrite: async (target, content, precondition) => server.write(target.relativePath, content, precondition),
 		sha256: async (text) => sha(text),
+		supportsSyncDelete: async () => {
+			if (faults.info > 0) {
+				faults.info--;
+				throw offline();
+			}
+			return opts.deleteCapable ?? true;
+		},
+		syncDelete: async (target, ifMatch) => server.delete(target.relativePath, ifMatch),
+		existsInVault: (vaultPath) => disk.has(vaultPath),
 	});
 	const base = (path: string): string | undefined => baseStore.get(SHARE)?.[path];
-	return { clock, server, disk, baseStore, writer, base };
+	return { clock, server, disk, baseStore, writer, base, faults };
 }
 
 // ─── 2. outbound writer ─────────────────────────────────────────────────────
@@ -447,7 +489,6 @@ describe("InboundFileDownloader with origin", () => {
 		manifest = new Map();
 		downloader = new InboundFileDownloader(
 			{ ...vault, readBinary: fakes.readBinary } as unknown as Vault,
-			{ trashFile: jest.fn() } as unknown as FileManager,
 			clientManager as never,
 			{ isOutboundSyncing: false } as never,
 			manifest,
@@ -547,5 +588,446 @@ describe("InboundFileDownloader with origin", () => {
 		listener.mockClear();
 		downloader.resolveKeepLocal("s", "note.md");
 		expect(listener).toHaveBeenCalledWith("s");
+	});
+});
+
+// ─── 4. deletes ─────────────────────────────────────────────────
+
+describe("decideOutboundDelete: base / server / origin", () => {
+	const B = "sha-base";
+	const S = "sha-server";
+	const cases: Array<[string, string | undefined, ServerSyncItem | undefined, OutboundDeleteDecision]> = [
+		["no server item -> gone", B, undefined, { kind: "gone" }],
+		["crdt mirror -> delete it", undefined, { path: "a.md", sha256: S, origin: "crdt" }, { kind: "delete", ifMatch: S }],
+		["external == base we pulled -> delete", S, { path: "a.md", sha256: S, origin: "external" }, { kind: "delete", ifMatch: S }],
+		["external not pulled -> keep", B, { path: "a.md", sha256: S, origin: "external" }, { kind: "keep-external" }],
+		["external, no base -> keep", undefined, { path: "a.md", sha256: S, origin: "external" }, { kind: "keep-external" }],
+		["legacy item (no origin) == base -> delete", S, { path: "a.md", sha256: S }, { kind: "delete", ifMatch: S }],
+	];
+	test.each(cases)("%s", (_name, base, server, expected) => {
+		expect(decideOutboundDelete(base, server)).toEqual(expected);
+	});
+});
+
+describe("OutboundSyncWriter deletes", () => {
+	test("a deleted note leaves the sync protocol after the debounce, If-Match the crdt mirror", async () => {
+		const { clock, server, writer, baseStore, base } = setup();
+		server.put("_acceptance/roundtrip.md", "roundtrip", "crdt");
+		baseStore.set(SHARE, { "_acceptance/roundtrip.md": sha("roundtrip") });
+
+		writer.notifyLocalDelete(`${FOLDER}/_acceptance/roundtrip.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS - 1);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(1);
+
+		expect(server.deletes).toEqual([
+			expect.objectContaining({ path: "_acceptance/roundtrip.md", ifMatch: sha("roundtrip") }),
+		]);
+		expect(server.items.has("_acceptance/roundtrip.md")).toBe(false);
+		expect(base("_acceptance/roundtrip.md")).toBeUndefined();
+	});
+
+	test("a folder delete removes every entry under it and nothing beside it", async () => {
+		const { clock, server, writer } = setup();
+		server.put("dir/a.md", "a", "crdt");
+		server.put("dir/sub/b.md", "b", "crdt");
+		server.put("dir2/c.md", "c", "crdt");
+		server.put("dir.md", "d", "crdt");
+
+		writer.notifyLocalDelete(`${FOLDER}/dir`, true);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS + MIN_WRITE_INTERVAL_MS * 3);
+
+		expect(server.deletes.map((d) => d.path).sort()).toEqual(["dir/a.md", "dir/sub/b.md"]);
+		expect(Array.from(server.items.keys()).sort()).toEqual(["dir.md", "dir2/c.md"]);
+	});
+
+	test("an external version the client has not pulled is not deleted", async () => {
+		const { clock, server, writer, baseStore } = setup();
+		server.put("n.md", "written by an agent after our pull", "external");
+		baseStore.set(SHARE, { "n.md": sha("what we pulled") });
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.deletes).toHaveLength(0);
+		expect(server.items.has("n.md")).toBe(true);
+	});
+
+	test("an external version equal to the client's base is deleted", async () => {
+		const { clock, server, writer, baseStore } = setup();
+		server.put("n.md", "pulled", "external");
+		baseStore.set(SHARE, { "n.md": sha("pulled") });
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS);
+
+		expect(server.deletes.map((d) => d.ifMatch)).toEqual([sha("pulled")]);
+	});
+
+	test("412 because an agent wrote meanwhile: the newer external version is kept", async () => {
+		const { clock, server, writer, baseStore } = setup();
+		server.put("n.md", "v1", "crdt");
+		baseStore.set(SHARE, { "n.md": sha("v1") });
+		server.beforeWrite = () => server.put("n.md", "v2 from an agent", "external");
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.deletes).toHaveLength(0);
+		expect(server.items.get("n.md")?.content).toBe("v2 from an agent");
+	});
+
+	test("412 because another client mirrored first (crdt): one re-read, then deleted", async () => {
+		const { clock, server, writer } = setup();
+		server.put("n.md", "v1", "crdt");
+		server.beforeWrite = () => server.put("n.md", "v1 + peer line", "crdt");
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.deletes.map((d) => d.ifMatch)).toEqual([sha("v1 + peer line")]);
+		expect(server.items.has("n.md")).toBe(false);
+	});
+
+	test("404: already gone, the base is cleared and nothing retries", async () => {
+		const { clock, server, writer, baseStore, base } = setup();
+		server.put("n.md", "v1", "crdt");
+		baseStore.set(SHARE, { "n.md": sha("v1") });
+		server.beforeWrite = () => server.items.delete("n.md");
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 4);
+
+		expect(server.deletes).toHaveLength(0);
+		expect(base("n.md")).toBeUndefined();
+	});
+
+	test("429 honours Retry-After", async () => {
+		const { clock, server, writer } = setup();
+		server.put("n.md", "v1", "crdt");
+		server.failNext = new RelayHttpError(429, "slow down", 20_000);
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(20_000);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+	});
+
+	test("a delete cancels a pending write of the same path", async () => {
+		const { clock, server, disk, writer } = setup();
+		server.put("n.md", "v1", "crdt");
+		disk.set(`${FOLDER}/n.md`, "v1 edited");
+		writer.notifyLocalChange(`${FOLDER}/n.md`);
+		disk.delete(`${FOLDER}/n.md`);
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.writes).toHaveLength(0);
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+	});
+
+	test("re-created before the flush: the write wins, nothing is deleted", async () => {
+		const { clock, server, disk, writer } = setup();
+		server.put("n.md", "v1", "crdt");
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		disk.set(`${FOLDER}/n.md`, "back again");
+		writer.notifyLocalChange(`${FOLDER}/n.md`);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.deletes).toHaveLength(0);
+		expect(server.items.get("n.md")?.content).toBe("back again");
+	});
+
+	test("rename: old path deleted, new path written", async () => {
+		const { clock, server, disk, writer } = setup();
+		server.put("old.md", "text", "crdt");
+		disk.set(`${FOLDER}/new.md`, "text");
+
+		writer.notifyLocalDelete(`${FOLDER}/old.md`, false);
+		writer.notifyLocalChange(`${FOLDER}/new.md`);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS + MIN_WRITE_INTERVAL_MS * 2);
+
+		expect(Array.from(server.items.keys())).toEqual(["new.md"]);
+	});
+
+	test("stays off when the server does not advertise sync_delete", async () => {
+		const { clock, server, writer } = setup({ deleteCapable: false });
+		server.put("n.md", "v1", "crdt");
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS * 2);
+
+		expect(server.deletes).toHaveLength(0);
+	});
+
+	test("deletes are paced like writes", async () => {
+		const { clock, server, writer } = setup();
+		for (const n of ["a", "b", "c"]) server.put(`dir/${n}.md`, n, "crdt");
+
+		writer.notifyLocalDelete(`${FOLDER}/dir`, true);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS + MIN_WRITE_INTERVAL_MS * 3);
+
+		const at = server.deletes.map((d) => d.at);
+		expect(at).toHaveLength(3);
+		expect(at[1] - at[0]).toBeGreaterThanOrEqual(MIN_WRITE_INTERVAL_MS);
+		expect(at[2] - at[1]).toBeGreaterThanOrEqual(MIN_WRITE_INTERVAL_MS);
+	});
+
+	test("reconcile deletes entries gone from disk and CRDT, under the same rules", async () => {
+		const { clock, server, writer, baseStore } = setup();
+		server.put("deleted-offline.md", "x", "crdt");
+		server.put("still-in-crdt.md", "y", "crdt");
+		server.put("pulled-then-deleted.md", "z", "external");
+		server.put("agent-not-pulled.md", "w", "external");
+		baseStore.set(SHARE, { "pulled-then-deleted.md": sha("z") });
+		const live = new Set(["still-in-crdt.md"]);
+
+		await writer.reconcileDeletes(
+			{ shareId: SHARE, serverId: SERVER },
+			(rel) => `${FOLDER}/${rel}`,
+			(rel) => live.has(rel),
+		);
+		await clock.advance(MIN_WRITE_INTERVAL_MS * 4);
+
+		expect(server.deletes.map((d) => d.path).sort()).toEqual([
+			"deleted-offline.md",
+			"pulled-then-deleted.md",
+		]);
+		expect(Array.from(server.items.keys()).sort()).toEqual(["agent-not-pulled.md", "still-in-crdt.md"]);
+	});
+
+	test("reconcile does not delete an entry that came back to the CRDT before the flush", async () => {
+		const { clock, server, writer } = setup();
+		server.put("a.md", "x", "crdt");
+		server.put("b.md", "y", "crdt");
+		const live = new Set<string>();
+
+		await writer.reconcileDeletes(
+			{ shareId: SHARE, serverId: SERVER },
+			(rel) => `${FOLDER}/${rel}`,
+			(rel) => live.has(rel),
+		);
+		live.add("b.md");
+		await clock.advance(MIN_WRITE_INTERVAL_MS * 4);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["a.md"]);
+	});
+	test("files-index unreadable at flush: the delete is kept and retried", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "v1", "crdt");
+		faults.index = 1;
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(TRANSIENT_RETRY_MS);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+		expect(server.items.has("n.md")).toBe(false);
+	});
+
+	test("server-info unreadable at flush: not taken for 'unsupported', the delete is retried", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("dir/a.md", "a", "crdt");
+		server.put("dir/b.md", "b", "crdt");
+		faults.info = 1;
+
+		writer.notifyLocalDelete(`${FOLDER}/dir`, true);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(TRANSIENT_RETRY_MS + MIN_WRITE_INTERVAL_MS * 2);
+
+		expect(server.deletes.map((d) => d.path).sort()).toEqual(["dir/a.md", "dir/b.md"]);
+	});
+
+	test("files-index unreadable on the 412 re-read: the delete is retried", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "v1", "crdt");
+		server.beforeWrite = () => {
+			server.put("n.md", "v1 + peer line", "crdt");
+			faults.index = 1;
+		};
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(TRANSIENT_RETRY_MS);
+
+		expect(server.deletes.map((d) => d.ifMatch)).toEqual([sha("v1 + peer line")]);
+	});
+
+	test("a delete that keeps failing gives up after DELETE_MAX_ATTEMPTS", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "v1", "crdt");
+		faults.index = 1_000;
+
+		writer.notifyLocalDelete(`${FOLDER}/n.md`, false);
+		await clock.advance(OUTBOUND_DEBOUNCE_MS + TRANSIENT_RETRY_MS * (DELETE_MAX_ATTEMPTS + 5));
+
+		expect(1_000 - faults.index).toBe(DELETE_MAX_ATTEMPTS);
+		expect(server.deletes).toHaveLength(0);
+	});
+
+	test("reconcile: an entry back in the CRDT during the pacing wait is not deleted", async () => {
+		const { clock, server, writer } = setup();
+		server.put("a.md", "x", "crdt");
+		server.put("b.md", "y", "crdt");
+		const live = new Set<string>();
+		// b.md comes back while its DELETE waits for the write slot after a.md's.
+		server.beforeWrite = () => {
+			clock.scheduleTimeout(() => live.add("b.md"), MIN_WRITE_INTERVAL_MS / 2);
+		};
+
+		await writer.reconcileDeletes(
+			{ shareId: SHARE, serverId: SERVER },
+			(rel) => `${FOLDER}/${rel}`,
+			(rel) => live.has(rel),
+		);
+		await clock.advance(MIN_WRITE_INTERVAL_MS * 4);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["a.md"]);
+		expect(server.items.has("b.md")).toBe(true);
+	});
+
+	test("reconcile: the liveness check survives a transient retry", async () => {
+		const { clock, server, writer } = setup();
+		server.put("a.md", "x", "crdt");
+		server.failNext = new RelayHttpError(503, "unavailable");
+		const live = new Set<string>();
+
+		await writer.reconcileDeletes(
+			{ shareId: SHARE, serverId: SERVER },
+			(rel) => `${FOLDER}/${rel}`,
+			(rel) => live.has(rel),
+		);
+		await clock.advance(MIN_WRITE_INTERVAL_MS);
+		expect(server.deletes).toHaveLength(0);
+		live.add("a.md");
+		await clock.advance(TRANSIENT_RETRY_MS * 2);
+
+		expect(server.deletes).toHaveLength(0);
+		expect(server.items.has("a.md")).toBe(true);
+	});
+
+	test("reconcile: a transient retry still deletes an entry that stayed gone", async () => {
+		const { clock, server, writer } = setup();
+		server.put("a.md", "x", "crdt");
+		server.failNext = new RelayHttpError(503, "unavailable");
+
+		await writer.reconcileDeletes(
+			{ shareId: SHARE, serverId: SERVER },
+			(rel) => `${FOLDER}/${rel}`,
+			() => false,
+		);
+		await clock.advance(MIN_WRITE_INTERVAL_MS + TRANSIENT_RETRY_MS);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["a.md"]);
+	});
+	test("reconcile: server-info unreadable on the first scan, the scan retries without a reconnect", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "x", "crdt");
+		faults.info = 1;
+
+		await writer.reconcileDeletes({ shareId: SHARE, serverId: SERVER }, (rel) => `${FOLDER}/${rel}`, () => false);
+		await clock.advance(MIN_WRITE_INTERVAL_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(TRANSIENT_RETRY_MS + MIN_WRITE_INTERVAL_MS);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+		expect(server.items.size).toBe(0);
+	});
+
+	test("reconcile: files-index unreadable on the first scan, the scan retries without a reconnect", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "x", "crdt");
+		faults.index = 1;
+
+		await writer.reconcileDeletes({ shareId: SHARE, serverId: SERVER }, (rel) => `${FOLDER}/${rel}`, () => false);
+		await clock.advance(MIN_WRITE_INTERVAL_MS);
+		expect(server.deletes).toHaveLength(0);
+		await clock.advance(TRANSIENT_RETRY_MS + MIN_WRITE_INTERVAL_MS);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+	});
+
+	test("reconcile: a retried scan still skips entries that came back meanwhile", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("a.md", "x", "crdt");
+		server.put("b.md", "y", "crdt");
+		faults.index = 1;
+		const live = new Set<string>();
+
+		await writer.reconcileDeletes({ shareId: SHARE, serverId: SERVER }, (rel) => `${FOLDER}/${rel}`, (rel) => live.has(rel));
+		live.add("b.md");
+		await clock.advance(TRANSIENT_RETRY_MS + MIN_WRITE_INTERVAL_MS * 3);
+
+		expect(server.deletes.map((d) => d.path)).toEqual(["a.md"]);
+	});
+
+	test("reconcile: a scan that keeps failing gives up after DELETE_MAX_ATTEMPTS", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "x", "crdt");
+		faults.index = 1_000;
+
+		await writer.reconcileDeletes({ shareId: SHARE, serverId: SERVER }, (rel) => `${FOLDER}/${rel}`, () => false);
+		await clock.advance(TRANSIENT_RETRY_MS * (DELETE_MAX_ATTEMPTS + 5));
+
+		expect(1_000 - faults.index).toBe(DELETE_MAX_ATTEMPTS);
+		expect(server.deletes).toHaveLength(0);
+	});
+
+	test("reconcile: a new reconnect replaces a pending scan retry instead of doubling it", async () => {
+		const { clock, server, writer, faults } = setup();
+		server.put("n.md", "x", "crdt");
+		faults.index = 1;
+		const share = { shareId: SHARE, serverId: SERVER };
+
+		await writer.reconcileDeletes(share, (rel) => `${FOLDER}/${rel}`, () => false);
+		const readsBefore = server.indexReads;
+		await writer.reconcileDeletes(share, (rel) => `${FOLDER}/${rel}`, () => false);
+		await clock.advance(TRANSIENT_RETRY_MS * 3);
+
+		expect(server.indexReads - readsBefore).toBe(1);
+		expect(server.deletes.map((d) => d.path)).toEqual(["n.md"]);
+	});
+});
+
+describe("isLocalRemoval: own delete vs echo", () => {
+	const records = new Set(["note.md", "dir", "plain/child.md"]);
+	const registry = {
+		shareFor: (path: string) =>
+			path.startsWith(`${FOLDER}/`)
+				? {
+						path: FOLDER,
+						folderIndex: {
+							recordFor: (v: string) => (records.has(v) ? {} : undefined),
+							eachRecord: (fn: (meta: object, path: string) => void) => records.forEach((r) => fn({}, r)),
+						},
+					}
+				: null,
+	} as unknown as ShareRegistry;
+
+	test("a path still in the folder index is the user's own delete", () => {
+		expect(isLocalRemoval(registry, `${FOLDER}/note.md`, () => false)).toBe(true);
+		expect(isLocalRemoval(registry, `${FOLDER}/dir`, () => false)).toBe(true);
+	});
+
+	test("a folder without its own record counts by its contents", () => {
+		expect(isLocalRemoval(registry, `${FOLDER}/plain`, () => false)).toBe(true);
+		expect(isLocalRemoval(registry, `${FOLDER}/pla`, () => false)).toBe(false);
+	});
+
+	test("a path a peer already removed from the index is an echo", () => {
+		expect(isLocalRemoval(registry, `${FOLDER}/gone.md`, () => false)).toBe(false);
+	});
+
+	test("an inbound-downloader removal is an echo", () => {
+		expect(isLocalRemoval(registry, `${FOLDER}/note.md`, () => true)).toBe(false);
+	});
+
+	test("outside every share: nothing to report", () => {
+		expect(isLocalRemoval(registry, "Private/note.md", () => false)).toBe(false);
 	});
 });

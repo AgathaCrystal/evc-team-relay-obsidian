@@ -281,7 +281,7 @@ describe("share list routing of a dormant share", () => {
 			downloadFile: jest.fn(async () => new ArrayBuffer(4)),
 		};
 		const web = { isOutboundSyncing: false };
-		const downloader = new InboundFileDownloader(vault as never, { trashFile: jest.fn() } as never, client as never, web as never);
+		const downloader = new InboundFileDownloader(vault as never, client as never, web as never);
 		const clock = new MockClock();
 		const poller = new InboundSyncPoller(clock, client as never, web as never, downloader, 30_000, new Map());
 		const tracker = new FolderShareTracker(registry, vault as never, () => poller);

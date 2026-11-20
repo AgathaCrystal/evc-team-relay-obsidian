@@ -6,13 +6,13 @@
  */
 
 import { normalizePath, Notice, TFile, Vault } from "obsidian";
-import type { FileManager } from "obsidian";
 import { dirname, join } from "path-browserify";
 import { namedLogger } from "./logging";
 import { isTransientRelayFailure } from "./relayRequestErrors";
 import { sha256Hex } from "./contentDigest";
 import type { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
 import type { WebSyncManager } from "./WebSyncManager";
+import { normalizeLineEndings } from "./textEquivalence";
 
 const log = namedLogger("[InboundFileDownloader]");
 
@@ -21,11 +21,43 @@ const log = namedLogger("[InboundFileDownloader]");
  * `getConflicts()` for the "Team Relay: Show sync conflicts" command. */
 export interface SyncConflict {
 	shareId: string;
+	serverId: string;
 	relativePath: string;
 	vaultPath: string;
 	localHash: string;
 	serverHash: string;
 	detectedAt: number;
+	/** Where the local text came from: "relay" = it is the shared
+	 * live note exactly as the relay has it, not an edit made on this device;
+	 * "device" = it differs from the relay too; undefined = unknown. */
+	localSource?: "relay" | "device";
+}
+
+/** Text files whose content the downloader may compare line by line. */
+function isComparableTextPath(path: string): boolean {
+	return /\.(md|canvas)$/i.test(path);
+}
+
+/**
+ * True when every non-empty line of `server` appears in `local`, whole and in
+ * the same order: the local text is the server's text plus added
+ * lines, so adopting the server version as the base and pushing the local
+ * text over it loses no line of the server version. Blank lines carry no
+ * content and are ignored. A line edited or deleted on either side fails the
+ * check; then the user decides. The one case it cannot tell apart is a line
+ * the server deleted that the local text still has: it is kept, i.e. text is
+ * restored rather than lost.
+ */
+export function containsAllLinesInOrder(local: string, server: string): boolean {
+	const localLines = normalizeLineEndings(local).split("\n");
+	let at = 0;
+	for (const line of normalizeLineEndings(server).split("\n")) {
+		if (line.trim() === "") continue;
+		while (at < localLines.length && localLines[at] !== line) at++;
+		if (at === localLines.length) return false;
+		at++;
+	}
+	return true;
 }
 
 export class InboundFileDownloader {
@@ -56,9 +88,18 @@ export class InboundFileDownloader {
 	// version to be pulled first.
 	private passListener: ((shareId: string) => void) | null = null;
 
+	// Whether the local file is the shared live note exactly as the relay has
+	// it; only used to tell the user where a conflict's local text
+	// came from.
+	private relayTextProbe: ((vaultPath: string) => Promise<boolean>) | null = null;
+
+	// Resolves a function that sets the note's live CRDT text,
+	// or null when the path has no CRDT document; then the caller writes the
+	// file as an ordinary edit.
+	private liveTextTarget: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null = null;
+
 	constructor(
 		vault: Vault,
-		private readonly fileManager: FileManager,
 		clientManager: RelayOnPremShareClientManager,
 		webSyncManager: WebSyncManager,
 		hashManifestStore: Map<string, Record<string, string>> = new Map(),
@@ -79,6 +120,14 @@ export class InboundFileDownloader {
 
 	setPassListener(listener: ((shareId: string) => void) | null): void {
 		this.passListener = listener;
+	}
+
+	setRelayTextProbe(probe: ((vaultPath: string) => Promise<boolean>) | null): void {
+		this.relayTextProbe = probe;
+	}
+
+	setLiveTextTarget(target: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null): void {
+		this.liveTextTarget = target;
 	}
 
 	/**
@@ -226,8 +275,9 @@ export class InboundFileDownloader {
 			// Only the read + hash computation is I/O that can legitimately fail;
 			// the notify-and-skip decision below is not wrapped, so a bug there
 			// surfaces as itself instead of being mislabeled a read failure.
-			const localHash = await this._localHash(abstractFile, vaultPath);
-			if (localHash === undefined) return;
+			const local = await this._readLocal(abstractFile, vaultPath);
+			if (local === undefined) return;
+			const localHash = local.hash;
 			// The vault already holds exactly the server's version (e.g. it
 			// arrived through the CRDT, or this client wrote it): nothing to
 			// write, only the base moves.
@@ -236,10 +286,26 @@ export class InboundFileDownloader {
 				this.conflicts.delete(`${shareId}:${relativePath}`);
 				return;
 			}
+			// No base yet (fresh device, reinstall, new member) and the local
+			// text already holds every line of the server version, typically
+			// the live note edited in Obsidian after that version was pulled
+			// elsewhere: adopt it as the base without writing anything, so the
+			// outbound writer can mirror the local text over it.
+			// Without this the writer waits for this pass and this pass waits
+			// for the user, and the edit never reaches the sync protocol.
+			if (
+				lastHash === undefined &&
+				(await this._localExtendsServer(local.bytes, serverSha256, shareId, serverId, relativePath, vaultPath))
+			) {
+				shareManifest[relativePath] = serverSha256;
+				this.conflicts.delete(`${shareId}:${relativePath}`);
+				return;
+			}
 			const expectedHash = lastHash ?? serverSha256;
 			if (localHash !== expectedHash) {
 				const conflictKey = `${shareId}:${relativePath}`;
 				const existing = this.conflicts.get(conflictKey);
+				const localSource = await this._localSource(vaultPath);
 				// Dedup: don't re-notify on every sync cycle while neither side of the
 				// conflict has moved — that's the "toast stack grows forever" bug. Do
 				// re-notify if the local edit changed again, or the server moved (a
@@ -250,11 +316,13 @@ export class InboundFileDownloader {
 					existing.serverHash === serverSha256;
 				this.conflicts.set(conflictKey, {
 					shareId,
+					serverId,
 					relativePath,
 					vaultPath,
 					localHash,
 					serverHash: serverSha256,
 					detectedAt: existing?.detectedAt ?? Date.now(),
+					localSource,
 				});
 				if (isSameConflictAsLastNotified) {
 					log("Sync conflict still unresolved, not re-notifying", { vaultPath });
@@ -267,16 +335,21 @@ export class InboundFileDownloader {
 					serverHash: serverSha256,
 				});
 				new Notice(
-					`Team Relay: skipped syncing "${relativePath}" — local changes ` +
-						`would have been overwritten by the relay version. Run ` +
-						`"Team Relay: Show sync conflicts" to resolve.`,
+					localSource === "relay"
+						? `Team Relay: "${relativePath}" differs from the relay's sync copy. ` +
+							`The note on this device is the shared live note from the relay, ` +
+							`not an edit made here. Run "Team Relay: Show sync conflicts" to ` +
+							`choose which version to keep.`
+						: `Team Relay: skipped syncing "${relativePath}" — local changes ` +
+							`would have been overwritten by the relay version. Run ` +
+							`"Team Relay: Show sync conflicts" to resolve.`,
 					8000,
 				);
 				return;
 			}
 		}
 		// Reaching here means we're about to download: either the local file is
-		// gone (deleted manually, or via resolveTakeServer()) or its content now
+		// gone (deleted manually) or its content now
 		// matches what we expected. Either way any previously-tracked conflict
 		// for this path is stale — drop it so getConflicts() doesn't list a file
 		// that's no longer actually in conflict.
@@ -323,14 +396,69 @@ export class InboundFileDownloader {
 
 	/** sha256 of the local file, or undefined when it cannot be read (then nothing is written). */
 	private async _localHash(file: TFile, vaultPath: string): Promise<string | undefined> {
+		return (await this._readLocal(file, vaultPath))?.hash;
+	}
+
+	/** The local file's bytes and sha256, or undefined when it cannot be read. */
+	private async _readLocal(
+		file: TFile,
+		vaultPath: string,
+	): Promise<{ bytes: ArrayBuffer; hash: string } | undefined> {
 		try {
-			const localBytes = await this.vault.readBinary(file);
-			return await sha256Hex(localBytes);
+			const bytes = await this.vault.readBinary(file);
+			return { bytes, hash: await sha256Hex(bytes) };
 		} catch (err: unknown) {
 			log("Could not read existing file, skipping to avoid data loss", {
 				vaultPath,
 				error: err instanceof Error ? err.message : String(err),
 			});
+			return undefined;
+		}
+	}
+
+	/**
+	 * Whether the local text holds every line of the server version
+	 * (`containsAllLinesInOrder`). Reads the server version without writing it;
+	 * a version that moved since files-index (sha mismatch) or cannot be read
+	 * counts as "no", so the ordinary conflict path decides.
+	 */
+	private async _localExtendsServer(
+		localBytes: ArrayBuffer,
+		serverSha256: string,
+		shareId: string,
+		serverId: string,
+		relativePath: string,
+		vaultPath: string,
+	): Promise<boolean> {
+		if (!isComparableTextPath(relativePath)) return false;
+		let serverBytes: ArrayBuffer;
+		try {
+			serverBytes = await this.clientManager.downloadFile(serverId, shareId, relativePath);
+		} catch (err: unknown) {
+			log("Could not read the server version to compare", {
+				vaultPath,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			if (isTransientRelayFailure(err)) throw err;
+			return false;
+		}
+		if ((await sha256Hex(serverBytes)) !== serverSha256) return false;
+		const decoder = new TextDecoder();
+		const extends_ = containsAllLinesInOrder(decoder.decode(localBytes), decoder.decode(serverBytes));
+		if (extends_) {
+			log("Local text holds every line of the server version, adopting it as the base", {
+				vaultPath,
+				serverHash: serverSha256,
+			});
+		}
+		return extends_;
+	}
+
+	private async _localSource(vaultPath: string): Promise<"relay" | "device" | undefined> {
+		if (!this.relayTextProbe) return undefined;
+		try {
+			return (await this.relayTextProbe(vaultPath)) ? "relay" : "device";
+		} catch {
 			return undefined;
 		}
 	}
@@ -341,20 +469,57 @@ export class InboundFileDownloader {
 	}
 
 	/**
-	 * Resolve a conflict by taking the server version: trash the local file so the
-	 * next `downloadShare()` pass finds no local content to guard and writes the
-	 * server copy fresh. Mirrors the manual recipe this bug's report used to fix
-	 * the one already-live conflict by hand.
+	 * Resolve a conflict by taking the server version: replace the
+	 * local text with the relay's sync copy in place, as an ordinary edit. The
+	 * file is never trashed: a delete in a shared folder reaches the CRDT and
+	 * removes the note for everyone in the share.
+	 *
+	 * A note with a live CRDT document gets the same bytes on disk under the echo
+	 * guard first, and only once that write succeeded the server text in its
+	 * CRDT (the relay carries the change to the other members): a failed write
+	 * leaves the shared note and the conflict untouched. Any other file is
+	 * written with an ordinary vault modify, so the usual modify handling
+	 * carries it to the relay. The server hash becomes the base, so the next
+	 * pass sees no conflict and the outbound writer finds local = server and
+	 * pushes nothing.
 	 */
 	async resolveTakeServer(shareId: string, relativePath: string): Promise<void> {
 		const key = `${shareId}:${relativePath}`;
 		const conflict = this.conflicts.get(key);
 		if (!conflict) return;
-		const abstractFile = this.vault.getAbstractFileByPath(conflict.vaultPath);
-		if (abstractFile instanceof TFile) {
-			await this.fileManager.trashFile(abstractFile);
+		const { vaultPath, serverId } = conflict;
+		const abstractFile = this.vault.getAbstractFileByPath(vaultPath);
+		if (!(abstractFile instanceof TFile)) {
+			// Nothing local left to replace: the next pass writes the server copy.
+			this.conflicts.delete(key);
+			return;
 		}
+
+		const serverBytes = await this.clientManager.downloadFile(serverId, shareId, relativePath);
+		const serverHash = await sha256Hex(serverBytes);
+		const applyLive =
+			this.liveTextTarget && isComparableTextPath(relativePath)
+				? await this.liveTextTarget(vaultPath)
+				: null;
+
+		if (applyLive) {
+			// The CRDT gets this text right after; the disk write is not a new edit.
+			this.writingPaths.add(vaultPath);
+			try {
+				await this.vault.modifyBinary(abstractFile, serverBytes);
+			} finally {
+				this.writingPaths.delete(vaultPath);
+			}
+			applyLive(new TextDecoder().decode(serverBytes));
+		} else {
+			await this.vault.modifyBinary(abstractFile, serverBytes);
+		}
+
+		const shareManifest = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
+		shareManifest[relativePath] = serverHash;
+		this.lastWrittenHash.set(shareId, shareManifest);
 		this.conflicts.delete(key);
+		log("Replaced local text with the server version", { vaultPath, serverHash, live: applyLive !== null });
 	}
 
 	/**
