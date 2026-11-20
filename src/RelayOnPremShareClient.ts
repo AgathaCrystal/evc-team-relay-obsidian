@@ -188,6 +188,8 @@ export interface ServerFeatures {
 	billing_enabled?: boolean;
 	/** sync-write honours X-Sync-Origin and files-index reports `origin`. */
 	sync_write_origin?: boolean;
+	/** DELETE /shares/{id}/sync-write removes a file from the sync protocol. */
+	sync_delete?: boolean;
 }
 
 /**
@@ -897,6 +899,29 @@ export class RelayOnPremShareClient {
 			);
 		}
 		return (await response.json()) as SyncWriteResult;
+	}
+
+	/**
+	 * Delete one file from a folder share's sync protocol, conditionally on
+	 * its current sha256 (DELETE /v1/shares/{id}/sync-write, ).
+	 * 404 = already gone, 412 = the file changed since it was read; both
+	 * surface as RelayHttpError with the status.
+	 */
+	async syncDeleteFile(shareId: string, path: string, ifMatchSha256: string): Promise<void> {
+		log(`Deleting folder file: ${shareId}/${path}`);
+		const headers = (await this.getHeaders()) as Record<string, string>;
+		headers["If-Match"] = `"${ifMatchSha256}"`;
+		const response = await platformFetch(
+			`${this.normalizedUrl}/v1/shares/${shareId}/sync-write?path=${encodeURIComponent(path)}`,
+			{ method: "DELETE", headers },
+		);
+		if (!response.ok) {
+			throw new RelayHttpError(
+				response.status,
+				`Failed to delete file: ${response.status} ${await response.text()}`,
+				parseRetryAfterMs(response.headers.get("Retry-After")),
+			);
+		}
 	}
 
 	/**

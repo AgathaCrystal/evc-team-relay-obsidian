@@ -18,7 +18,7 @@ import {
 } from "./OutboundSyncWriter";
 import type { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
 import { sameTextContent } from "./textEquivalence";
-import { toFolderRelativePath } from "./vaultRootPath";
+import { joinFolderPath, toFolderRelativePath } from "./vaultRootPath";
 import { applyDiffToYText } from "./ytextDiff";
 import type { ShareRegistry, VaultShare } from "./VaultShare";
 
@@ -127,8 +127,18 @@ export function createOutboundSyncWriter(opts: {
 				{ origin: "crdt" },
 			),
 		sha256: (text) => sha256Hex(new TextEncoder().encode(text).buffer),
+		supportsSyncDelete: async (serverId) => {
+			const client = clientManager.getClient(serverId);
+			if (!client) return false;
+			const info = await client.getServerInfo();
+			return info.features?.sync_delete === true;
+		},
+		syncDelete: (target, ifMatchSha256) =>
+			clientManager.syncDeleteFile(target.serverId, target.shareId, target.relativePath, ifMatchSha256),
+		existsInVault: (vaultPath) => vault.getAbstractFileByPath(vaultPath) !== null,
 	});
 }
+
 
 /**
  * Reconcile each folder share when it comes online: at start and after every
@@ -146,13 +156,27 @@ export function watchShareReconnects(opts: {
 	const reconcileFolder = (folder: VaultShare): void => {
 		void folder
 			.onceFreshlySynced()
-			.then(() => {
+			.then(async () => {
 				const paths = vault
 					.getFiles()
 					.map((file) => file.path)
 					.filter((path) => isOutboundSyncPath(path) && shareRegistry.shareFor(path) === folder);
 				log("Reconciling share with the sync protocol", { folder: folder.path, files: paths.length });
 				writer.reconcile(paths);
+				// Deletes made while offline: an entry neither on disk nor in the
+				// CRDT goes from the sync protocol too.
+				const shareId = folder.entityGuid;
+				const serverId = folder.config.onpremServerId;
+				if (!shareId || !serverId) return;
+				const toVaultPath = (relativePath: string): string => joinFolderPath(folder.path, relativePath);
+				// A share that left this vault meanwhile counts as live: a retried
+				// scan must never read an unloaded share as "everything deleted".
+				const stillShared = (): boolean => !!shareRegistry.locate((sf) => sf === folder);
+				await writer.reconcileDeletes({ shareId, serverId }, toVaultPath, (relativePath) =>
+					!stillShared() ||
+					vault.getAbstractFileByPath(toVaultPath(relativePath)) !== null ||
+					folder.folderIndex.recordFor(relativePath) !== undefined,
+				);
 			})
 			.catch((err: unknown) => {
 				log("Reconcile skipped", { error: err instanceof Error ? err.message : String(err) });

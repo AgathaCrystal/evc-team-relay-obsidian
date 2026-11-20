@@ -22,6 +22,20 @@
  * - 412: re-read; equal to local -> record base; otherwise one retry under
  *   the same rules. 429: honour Retry-After.
  * - Enabled only when the server advertises `features.sync_write_origin`.
+ *
+ * Deletes: the server does not infer a delete from the nav tree,
+ * so a local delete is reported explicitly (DELETE /sync-write, If-Match).
+ * - Source: a local delete of a file or folder (every files-index entry under
+ *   it) and the old path of a rename; never an inbound or remote-delete echo
+ *   (the wiring filters those). Same debounce and pacing as writes.
+ * - If-Match: the server sha, only when the item is a crdt mirror or equals
+ *   this client's base. An external version the client has not pulled is
+ *   never deleted.
+ * - 404: already gone, base cleared. 412: nothing deleted, one re-read under
+ *   the same rules. A path that exists in the vault again is left to writes.
+ * - Reconnect: an entry that is neither on disk nor in the CRDT is deleted
+ *   under the same rules (deletes made while offline).
+ * - Enabled only when the server advertises `features.sync_delete`.
  */
 
 import type { Clock } from "./Clock";
@@ -44,6 +58,12 @@ export const TRANSIENT_RETRY_MS = 30_000;
 export const INDEX_TTL_MS = 5_000;
 export const CAPABILITY_TTL_MS = 10 * 60_000;
 export const CAPABILITY_ERROR_TTL_MS = 60_000;
+/**
+ * A delete that could not reach the server (server-info, files-index or the
+ * DELETE itself failed) is retried this many times, ~10 min at
+ * TRANSIENT_RETRY_MS; after that the reconnect reconciliation catches it.
+ */
+export const DELETE_MAX_ATTEMPTS = 20;
 
 export const SYNC_ORIGIN_CRDT = "crdt";
 
@@ -83,6 +103,31 @@ export function decideOutboundWrite(
 	return { kind: "await-inbound" };
 }
 
+export type OutboundDeleteDecision =
+	| { kind: "gone" }
+	| { kind: "delete"; ifMatch: string }
+	| { kind: "keep-external" };
+
+/**
+ * The delete table (base / server / origin).
+ *
+ * - no server item                      -> already gone
+ * - server item is a crdt mirror        -> delete, If-Match server sha
+ * - server sha == base we pulled        -> delete, If-Match server sha
+ * - external version we have not pulled -> keep it
+ */
+export function decideOutboundDelete(
+	baseSha: string | undefined,
+	server: ServerSyncItem | undefined,
+): OutboundDeleteDecision {
+	if (!server) return { kind: "gone" };
+	if (server.origin === SYNC_ORIGIN_CRDT) return { kind: "delete", ifMatch: server.sha256 };
+	if (baseSha !== undefined && server.sha256 === baseSha) {
+		return { kind: "delete", ifMatch: server.sha256 };
+	}
+	return { kind: "keep-external" };
+}
+
 export function isOutboundSyncPath(path: string): boolean {
 	return /\.(md|canvas)$/i.test(path);
 }
@@ -118,11 +163,28 @@ export interface OutboundSyncDeps {
 	sha256(text: string): Promise<string>;
 	/** shareId -> relativePath -> sha the client last agreed with the server on. */
 	baseStore: Map<string, Record<string, string>>;
+	supportsSyncDelete(serverId: string): Promise<boolean>;
+	syncDelete(target: OutboundTarget, ifMatchSha256: string): Promise<void>;
+	/** Whether a file or folder exists at this vault path right now. */
+	existsInVault(vaultPath: string): boolean;
 }
 
 interface QueuedPath {
 	/** Reconcile entries do not wait for unsynced text: the next edit retries them. */
 	reconcile: boolean;
+}
+
+interface PendingDelete {
+	target: OutboundTarget;
+	/** A folder: every files-index entry under `target.relativePath`. */
+	folder: boolean;
+	/**
+	 * Reconcile: the entry must still be absent from disk and CRDT. Checked
+	 * again right before every DELETE, retries included.
+	 */
+	stillGone?: () => boolean;
+	/** Failed attempts so far (server-info, files-index or DELETE). */
+	attempts?: number;
 }
 
 export class OutboundSyncWriter {
@@ -134,6 +196,11 @@ export class OutboundSyncWriter {
 	private awaitingInbound = new Map<string, string>();
 	private indexCache = new Map<string, { at: number; items: Map<string, ServerSyncItem> }>();
 	private capability = new Map<string, { until: number; value: boolean }>();
+	private deleteCapability = new Map<string, { until: number; value: boolean }>();
+	/** vaultPath -> delete waiting for its debounce or the queue. */
+	private pendingDeletes = new Map<string, PendingDelete>();
+	/** shareId -> timer of a delete reconciliation waiting to retry its scan. */
+	private reconcileRetryTimers = new Map<string, number>();
 	private lastWriteAt = Number.NEGATIVE_INFINITY;
 	private pausedUntil = 0;
 	private destroyed = false;
@@ -144,8 +211,97 @@ export class OutboundSyncWriter {
 	notifyLocalChange(vaultPath: string): void {
 		if (this.destroyed || !isOutboundSyncPath(vaultPath)) return;
 		if (!this.deps.resolveTarget(vaultPath)) return;
+		// A re-create after a delete: the write wins.
+		this.pendingDeletes.delete(vaultPath);
 		this.notSyncedAttempts.delete(vaultPath);
 		this.schedule(vaultPath, OUTBOUND_DEBOUNCE_MS, false);
+	}
+
+	/**
+	 * A local delete of `vaultPath` (or the old path of a rename); a folder
+	 * removes every files-index entry under it. Never an inbound or
+	 * remote-delete echo: the caller filters those.
+	 */
+	notifyLocalDelete(vaultPath: string, folder: boolean): void {
+		if (this.destroyed) return;
+		const target = this.deps.resolveTarget(vaultPath);
+		if (!target) return;
+		if (folder && target.relativePath === "") return;
+		// A pending write of the deleted path would bring it back.
+		this.cancelPendingWrites(vaultPath, folder);
+		this.pendingDeletes.set(vaultPath, { target, folder });
+		this.schedule(vaultPath, OUTBOUND_DEBOUNCE_MS, false);
+	}
+
+	/**
+	 * Reconnect reconciliation of deletes: every files-index entry of the share
+	 * that is neither on disk nor in the CRDT (`isLive` false) is deleted under
+	 * the usual rules. Catches deletes made while offline. A scan that cannot
+	 * read server-info or the files-index is retried on its own, up to
+	 * DELETE_MAX_ATTEMPTS, without waiting for the next reconnect.
+	 */
+	async reconcileDeletes(
+		share: { shareId: string; serverId: string },
+		toVaultPath: (relativePath: string) => string,
+		isLive: (relativePath: string) => boolean,
+	): Promise<void> {
+		this.cancelReconcileRetry(share.shareId);
+		await this.reconcileDeletesPass(share, toVaultPath, isLive, 0);
+	}
+
+	private async reconcileDeletesPass(
+		share: { shareId: string; serverId: string },
+		toVaultPath: (relativePath: string) => string,
+		isLive: (relativePath: string) => boolean,
+		failures: number,
+	): Promise<void> {
+		if (this.destroyed) return;
+		let index: Map<string, ServerSyncItem>;
+		try {
+			const supported = await this.serverSupportsDelete(share.serverId);
+			if (supported === false) return;
+			if (supported === undefined) throw new Error("server-info unavailable");
+			index = await this.readIndex({ ...share, relativePath: "" }, true);
+		} catch (err: unknown) {
+			if (this.destroyed) return;
+			const attempts = failures + 1;
+			const error = err instanceof Error ? err.message : String(err);
+			if (attempts >= DELETE_MAX_ATTEMPTS) {
+				log("Delete reconciliation kept failing, leaving it to the next reconnect", {
+					shareId: share.shareId,
+					error,
+				});
+				return;
+			}
+			log("Delete reconciliation postponed", { shareId: share.shareId, error, attempts });
+			this.cancelReconcileRetry(share.shareId);
+			const timer = this.deps.clock.scheduleTimeout(() => {
+				this.reconcileRetryTimers.delete(share.shareId);
+				void this.reconcileDeletesPass(share, toVaultPath, isLive, attempts);
+			}, TRANSIENT_RETRY_MS);
+			this.reconcileRetryTimers.set(share.shareId, timer);
+			return;
+		}
+		const base = this.deps.baseStore.get(share.shareId) ?? {};
+		for (const item of index.values()) {
+			if (isLive(item.path)) continue;
+			const vaultPath = toVaultPath(item.path);
+			if (this.debounceTimers.has(vaultPath) || this.queue.has(vaultPath)) continue;
+			if (decideOutboundDelete(base[item.path], item).kind !== "delete") continue;
+			this.pendingDeletes.set(vaultPath, {
+				target: { ...share, relativePath: item.path },
+				folder: false,
+				stillGone: () => !isLive(item.path),
+			});
+			this.enqueue(vaultPath, true);
+		}
+	}
+
+	private cancelReconcileRetry(shareId: string): void {
+		const timer = this.reconcileRetryTimers.get(shareId);
+		if (timer === undefined) return;
+		this.deps.clock.cancelTimeout(timer);
+		this.reconcileRetryTimers.delete(shareId);
 	}
 
 	/**
@@ -187,9 +343,31 @@ export class OutboundSyncWriter {
 		this.destroyed = true;
 		for (const timer of this.debounceTimers.values()) this.deps.clock.cancelTimeout(timer);
 		this.debounceTimers.clear();
+		for (const timer of this.reconcileRetryTimers.values()) this.deps.clock.cancelTimeout(timer);
+		this.reconcileRetryTimers.clear();
 		this.queue.clear();
 		this.awaitingInbound.clear();
 		this.indexCache.clear();
+		this.pendingDeletes.clear();
+	}
+
+	private cancelPendingWrites(vaultPath: string, folder: boolean): void {
+		const hit = (path: string): boolean =>
+			path === vaultPath || (folder && path.startsWith(`${vaultPath}/`));
+		for (const [path, timer] of Array.from(this.debounceTimers)) {
+			if (!hit(path) || this.pendingDeletes.has(path)) continue;
+			this.deps.clock.cancelTimeout(timer);
+			this.debounceTimers.delete(path);
+		}
+		for (const path of Array.from(this.queue.keys())) {
+			if (hit(path) && !this.pendingDeletes.has(path)) this.queue.delete(path);
+		}
+		for (const path of Array.from(this.notSyncedAttempts.keys())) {
+			if (hit(path)) this.notSyncedAttempts.delete(path);
+		}
+		for (const path of Array.from(this.awaitingInbound.keys())) {
+			if (hit(path)) this.awaitingInbound.delete(path);
+		}
 	}
 
 	private schedule(vaultPath: string, delayMs: number, reconcile: boolean): void {
@@ -230,6 +408,12 @@ export class OutboundSyncWriter {
 	}
 
 	private async flush(vaultPath: string, entry: QueuedPath): Promise<void> {
+		const pendingDelete = this.pendingDeletes.get(vaultPath);
+		if (pendingDelete) {
+			this.pendingDeletes.delete(vaultPath);
+			await this.flushDelete(vaultPath, pendingDelete);
+			return;
+		}
 		const target = this.deps.resolveTarget(vaultPath);
 		if (!target) return;
 		if (!(await this.serverSupportsOrigin(target.serverId))) return;
@@ -320,6 +504,126 @@ export class OutboundSyncWriter {
 		}
 	}
 
+	private async flushDelete(vaultPath: string, request: PendingDelete): Promise<void> {
+		const { target } = request;
+		let index: Map<string, ServerSyncItem>;
+		try {
+			const supported = await this.serverSupportsDelete(target.serverId);
+			if (supported === false) return;
+			if (supported === undefined) throw new Error("server-info unavailable");
+			index = await this.readIndex(target, false);
+		} catch (err: unknown) {
+			this.retryDelete(vaultPath, request, err);
+			return;
+		}
+		const rel = target.relativePath;
+		if (!request.folder) {
+			await this.applyDelete(vaultPath, request, index.get(rel), false);
+			return;
+		}
+		const victims = Array.from(index.values()).filter((item) => item.path.startsWith(`${rel}/`));
+		for (const item of victims) {
+			if (this.destroyed) return;
+			const itemVaultPath = vaultPath + item.path.slice(rel.length);
+			const itemRequest: PendingDelete = { target: { ...target, relativePath: item.path }, folder: false };
+			await this.applyDelete(itemVaultPath, itemRequest, item, false);
+		}
+	}
+
+	/** Whether the delete still applies: nothing came back on disk or (reconcile) in the CRDT. */
+	private deleteStillWanted(vaultPath: string, request: PendingDelete): boolean {
+		if (this.destroyed || this.deps.existsInVault(vaultPath)) return false;
+		return !request.stillGone || request.stillGone();
+	}
+
+	private async applyDelete(
+		vaultPath: string,
+		request: PendingDelete,
+		server: ServerSyncItem | undefined,
+		retried: boolean,
+	): Promise<void> {
+		const { target } = request;
+		// Created again meanwhile (undo, rename back, a peer's re-create): writes own the path now.
+		if (!this.deleteStillWanted(vaultPath, request)) return;
+		const base = this.deps.baseStore.get(target.shareId)?.[target.relativePath];
+		const decision = decideOutboundDelete(base, server);
+		if (decision.kind === "gone") {
+			this.clearBase(target);
+			return;
+		}
+		if (decision.kind === "keep-external") {
+			log("External version not pulled, not deleting it", { vaultPath, serverSha: server?.sha256, base });
+			return;
+		}
+
+		await this.awaitWriteSlot();
+		// The pacing wait is long enough for the entry to come back.
+		if (!this.deleteStillWanted(vaultPath, request)) return;
+		try {
+			this.lastWriteAt = this.deps.clock.now();
+			await this.deps.syncDelete(target, decision.ifMatch);
+			this.forgetServerItem(target);
+			log("Removed deleted file from the sync protocol", { vaultPath, sha256: decision.ifMatch });
+		} catch (err: unknown) {
+			const status = err instanceof RelayHttpError ? err.status : undefined;
+			if (status === 404) {
+				this.forgetServerItem(target);
+				return;
+			}
+			if (status === 412) {
+				this.indexCache.delete(target.shareId);
+				if (retried) {
+					log("Delete precondition failed twice, leaving the server version", { vaultPath });
+					return;
+				}
+				let fresh: Map<string, ServerSyncItem>;
+				try {
+					fresh = await this.readIndex(target, true);
+				} catch (readErr: unknown) {
+					this.retryDelete(vaultPath, request, readErr);
+					return;
+				}
+				await this.applyDelete(vaultPath, request, fresh.get(target.relativePath), true);
+				return;
+			}
+			if (status === 429 || isTransientRelayFailure(err)) {
+				this.retryDelete(vaultPath, request, err);
+				return;
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Keep a delete that failed before reaching a verdict and try it again
+	 * later, with its liveness check. A 429 waits for Retry-After.
+	 */
+	private retryDelete(vaultPath: string, request: PendingDelete, err: unknown): void {
+		if (this.destroyed) return;
+		const attempts = (request.attempts ?? 0) + 1;
+		const status = err instanceof RelayHttpError ? err.status : undefined;
+		const error = err instanceof Error ? err.message : String(err);
+		if (attempts >= DELETE_MAX_ATTEMPTS) {
+			log("Delete kept failing, leaving it to the reconnect reconciliation", { vaultPath, status, error });
+			return;
+		}
+		let delay = TRANSIENT_RETRY_MS;
+		if (status === 429) {
+			const retryAfter = (err as RelayHttpError).retryAfterMs ?? DEFAULT_RETRY_AFTER_MS;
+			delay = Math.min(Math.max(retryAfter, 0), MAX_RETRY_AFTER_MS);
+			this.pausedUntil = this.deps.clock.now() + delay;
+		}
+		log("Delete postponed", { vaultPath, status, error, delay, attempts });
+		this.pendingDeletes.set(vaultPath, { ...request, attempts });
+		this.schedule(vaultPath, delay, false);
+	}
+
+	/** The entry is gone from the server: drop it from the cached index and the base. */
+	private forgetServerItem(target: OutboundTarget): void {
+		this.indexCache.get(target.shareId)?.items.delete(target.relativePath);
+		this.clearBase(target);
+	}
+
 	private async awaitWriteSlot(): Promise<void> {
 		const readyAt = Math.max(this.lastWriteAt + MIN_WRITE_INTERVAL_MS, this.pausedUntil);
 		const wait = readyAt - this.deps.clock.now();
@@ -344,6 +648,24 @@ export class OutboundSyncWriter {
 		return value;
 	}
 
+	/**
+	 * Whether the server accepts sync deletes; `undefined` when server-info
+	 * could not be read. Not cached then, so a retried delete asks again.
+	 */
+	private async serverSupportsDelete(serverId: string): Promise<boolean | undefined> {
+		const now = this.deps.clock.now();
+		const cached = this.deleteCapability.get(serverId);
+		if (cached && cached.until > now) return cached.value;
+		let value: boolean;
+		try {
+			value = await this.deps.supportsSyncDelete(serverId);
+		} catch {
+			return undefined;
+		}
+		this.deleteCapability.set(serverId, { until: now + CAPABILITY_TTL_MS, value });
+		return value;
+	}
+
 	private async readIndex(target: OutboundTarget, fresh: boolean): Promise<Map<string, ServerSyncItem>> {
 		const now = this.deps.clock.now();
 		const cached = this.indexCache.get(target.shareId);
@@ -356,6 +678,14 @@ export class OutboundSyncWriter {
 
 	private cacheItem(target: OutboundTarget, item: ServerSyncItem): void {
 		this.indexCache.get(target.shareId)?.items.set(item.path, item);
+	}
+
+	private clearBase(target: OutboundTarget): void {
+		const current = this.deps.baseStore.get(target.shareId);
+		if (!current || !(target.relativePath in current)) return;
+		const manifest = { ...current };
+		delete manifest[target.relativePath];
+		this.deps.baseStore.set(target.shareId, manifest);
 	}
 
 	private recordBase(target: OutboundTarget, sha: string): void {

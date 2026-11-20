@@ -200,6 +200,9 @@ function setup() {
 		getFilesIndex: async () => server.index(),
 		syncWrite: async (target, content, precondition) => server.write(target.relativePath, content, precondition),
 		sha256: async (text) => sha(text),
+		supportsSyncDelete: async () => false,
+		syncDelete: async () => undefined,
+		existsInVault: (vaultPath) => disk.has(vaultPath),
 	});
 	downloader.setPassListener((shareId) => writer.onInboundPass(shareId));
 	const base = (): string | undefined => baseStore.get(SHARE)?.[PATH];
