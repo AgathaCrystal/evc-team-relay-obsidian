@@ -60,6 +60,17 @@ export function containsAllLinesInOrder(local: string, server: string): boolean 
 	return true;
 }
 
+/**
+ * A note's live CRDT text, connected to the relay for "Use server version"
+ * `replace` sets the text as an ordinary edit and resolves once
+ * the update had time to leave this device; `release` drops a connection that
+ * was opened only for this and may be called more than once.
+ */
+export interface LiveText {
+	replace(text: string): Promise<void>;
+	release(): void;
+}
+
 export class InboundFileDownloader {
 	private vault: Vault;
 	private clientManager: RelayOnPremShareClientManager;
@@ -93,10 +104,10 @@ export class InboundFileDownloader {
 	// came from.
 	private relayTextProbe: ((vaultPath: string) => Promise<boolean>) | null = null;
 
-	// Resolves a function that sets the note's live CRDT text,
-	// or null when the path has no CRDT document; then the caller writes the
-	// file as an ordinary edit.
-	private liveTextTarget: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null = null;
+	// Resolves the note's live CRDT text, already connected to the relay
+	// or null when the path has no CRDT document; then the
+	// caller writes the file as an ordinary edit.
+	private liveTextTarget: ((vaultPath: string) => Promise<LiveText | null>) | null = null;
 
 	constructor(
 		vault: Vault,
@@ -126,7 +137,7 @@ export class InboundFileDownloader {
 		this.relayTextProbe = probe;
 	}
 
-	setLiveTextTarget(target: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null): void {
+	setLiveTextTarget(target: ((vaultPath: string) => Promise<LiveText | null>) | null): void {
 		this.liveTextTarget = target;
 	}
 
@@ -474,8 +485,10 @@ export class InboundFileDownloader {
 	 * file is never trashed: a delete in a shared folder reaches the CRDT and
 	 * removes the note for everyone in the share.
 	 *
-	 * A note with a live CRDT document gets the same bytes on disk under the echo
-	 * guard first, and only once that write succeeded the server text in its
+	 * A note with a live CRDT document is connected to the relay first (a closed
+	 * note has no connection, and text set in an unconnected Y.Doc never left
+	 * this device). Then it gets the same bytes on disk under the echo
+	 * guard, and only once that write succeeded the server text in its
 	 * CRDT (the relay carries the change to the other members): a failed write
 	 * leaves the shared note and the conflict untouched. Any other file is
 	 * written with an ordinary vault modify, so the usual modify handling
@@ -497,29 +510,35 @@ export class InboundFileDownloader {
 
 		const serverBytes = await this.clientManager.downloadFile(serverId, shareId, relativePath);
 		const serverHash = await sha256Hex(serverBytes);
-		const applyLive =
+		// Connected before anything changes: when the relay can't be reached
+		// this throws and the note and the conflict stay as they are.
+		const live =
 			this.liveTextTarget && isComparableTextPath(relativePath)
 				? await this.liveTextTarget(vaultPath)
 				: null;
 
-		if (applyLive) {
-			// The CRDT gets this text right after; the disk write is not a new edit.
-			this.writingPaths.add(vaultPath);
-			try {
+		try {
+			if (live) {
+				// The CRDT gets this text right after; the disk write is not a new edit.
+				this.writingPaths.add(vaultPath);
+				try {
+					await this.vault.modifyBinary(abstractFile, serverBytes);
+				} finally {
+					this.writingPaths.delete(vaultPath);
+				}
+				await live.replace(new TextDecoder().decode(serverBytes));
+			} else {
 				await this.vault.modifyBinary(abstractFile, serverBytes);
-			} finally {
-				this.writingPaths.delete(vaultPath);
 			}
-			applyLive(new TextDecoder().decode(serverBytes));
-		} else {
-			await this.vault.modifyBinary(abstractFile, serverBytes);
+		} finally {
+			live?.release();
 		}
 
 		const shareManifest = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
 		shareManifest[relativePath] = serverHash;
 		this.lastWrittenHash.set(shareId, shareManifest);
 		this.conflicts.delete(key);
-		log("Replaced local text with the server version", { vaultPath, serverHash, live: applyLive !== null });
+		log("Replaced local text with the server version", { vaultPath, serverHash, live: live !== null });
 	}
 
 	/**

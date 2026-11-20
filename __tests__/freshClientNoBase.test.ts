@@ -393,10 +393,14 @@ describe("Use server version replaces the text in place", () => {
 			writingDuringDiskWrite.push(env.downloader.isInboundWriting(file.path));
 			env.disk.set(file.path, textOf(data));
 		});
+		const released: string[] = [];
 		env.downloader.setLiveTextTarget(async (vaultPath) => {
 			expect(vaultPath).toBe(VAULT_PATH);
-			return (text) => {
-				crdtText = text;
+			return {
+				replace: async (text) => {
+					crdtText = text;
+				},
+				release: () => released.push(vaultPath),
 			};
 		});
 
@@ -407,6 +411,7 @@ describe("Use server version replaces the text in place", () => {
 		expect(writingDuringDiskWrite).toEqual([true]);
 		expect(env.downloader.isInboundWriting(VAULT_PATH)).toBe(false);
 		expect(env.trashFile).not.toHaveBeenCalled();
+		expect(released).toEqual([VAULT_PATH]);
 	});
 
 	test("without a live document the file is written as an ordinary edit (the modify handler carries it)", async () => {
@@ -428,9 +433,15 @@ describe("Use server version replaces the text in place", () => {
 		const env = await conflicted();
 		let crdtText = CRDT;
 		env.vault.modifyBinary.mockRejectedValueOnce(new Error("Disk full"));
-		env.downloader.setLiveTextTarget(async () => (text) => {
-			crdtText = text;
-		});
+		let released = 0;
+		env.downloader.setLiveTextTarget(async () => ({
+			replace: async (text) => {
+				crdtText = text;
+			},
+			release: () => {
+				released++;
+			},
+		}));
 
 		await expect(env.downloader.resolveTakeServer(SHARE, PATH)).rejects.toThrow("Disk full");
 
@@ -439,6 +450,20 @@ describe("Use server version replaces the text in place", () => {
 		expect(env.base()).toBeUndefined();
 		expect(env.downloader.getConflicts()).toHaveLength(1);
 		expect(env.downloader.isInboundWriting(VAULT_PATH)).toBe(false);
+		expect(released).toBe(1);
+	});
+
+	test("a note that cannot reach the relay keeps its text and the conflict", async () => {
+		const env = await conflicted();
+		env.downloader.setLiveTextTarget(async () => {
+			throw new Error("the relay did not answer for this note; nothing was changed");
+		});
+
+		await expect(env.downloader.resolveTakeServer(SHARE, PATH)).rejects.toThrow("relay did not answer");
+
+		expect(env.disk.get(VAULT_PATH)).toBe(CRDT);
+		expect(env.base()).toBeUndefined();
+		expect(env.downloader.getConflicts()).toHaveLength(1);
 	});
 
 	test("a failed download keeps the conflict and leaves the note untouched", async () => {

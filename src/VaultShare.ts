@@ -818,9 +818,50 @@ export class VaultShare extends ProviderBacked {
 		return roots;
 	}
 
-	/** webFolderExclusions source: hides server-move leftovers from web_folder_items. */
+	/**
+	 * Folders a peer removed (or moved away) that stay on this client's disk
+	 * only because they hold files the share does not sync: see
+	 * _maybeDeleteOrphanedFolder(). They are not part of the
+	 * share, so they are neither published again nor listed on the web. A
+	 * folder that gets a syncable file again leaves this set.
+	 */
+	retainedLocalOnlyFolders(): Set<string> {
+		const kept = new Set<string>();
+		if (this.isTornDown || !this.folderIndex) return kept;
+		let entries: TAbstractFile[] = [];
+		try {
+			entries = this.vaultFilesInScope();
+		} catch {
+			return kept;
+		}
+		for (const entry of entries) {
+			if (!(entry instanceof TFolder)) continue;
+			const vpath = this.toVirtualPath(entry.path);
+			if (!this.folderIndex.wasRemoved(vpath)) continue;
+			if (this._holdsSyncableFile(entry)) continue;
+			kept.add(vpath);
+		}
+		return kept;
+	}
+
+	private _holdsSyncableFile(folder: TFolder): boolean {
+		for (const child of folder.children ?? []) {
+			if (child instanceof TFolder) {
+				if (this._holdsSyncableFile(child)) return true;
+			} else if (this.isSyncableVaultFile(child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * webFolderExclusions source: hides server-move leftovers and retained
+	 * local-only folders from web_folder_items.
+	 */
 	webFolderExclusion(): ((vaultPath: string) => boolean) | null {
 		const roots = this.serverMoveRemnantRoots();
+		for (const kept of this.retainedLocalOnlyFolders()) roots.add(kept);
 		if (roots.size === 0) return null;
 		return (vaultPath) =>
 			this.containsPath(vaultPath) && isUnderSkippedPath(this.toVirtualPath(vaultPath), roots);
@@ -837,11 +878,12 @@ export class VaultShare extends ProviderBacked {
 		if (this.isTornDown) return;
 		const roots = this.serverMoveRemnantRoots();
 		if (roots.size > 0) this.rebindEntriesOutOfRemnants(roots);
-		const signature = [...roots].sort().join(", ");
+		const retained = this.retainedLocalOnlyFolders();
+		const signature = [...roots, ...retained].sort().join(", ");
 		if (signature === (this.serverMoveRemnantSignature ?? "")) return;
 		this.serverMoveRemnantSignature = signature;
 		if (signature) {
-			console.debug(`[VaultShare] ${this.path}: server-move leftovers kept out of the share: ${signature}`);
+			console.debug(`[VaultShare] ${this.path}: server-move leftovers and local-only folders kept out of the share: ${signature}`);
 		}
 		notifyWebFolderExclusionsChanged(this.path);
 	}
@@ -939,6 +981,21 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	/**
+	 * On-disk entries adoptLocalFiles() may publish: everything in scope but
+	 * notes a peer deleted while this client was away, server-move leftovers
+	 * and folders kept only for their local-only files.
+	 */
+	private adoptableFiles(): TAbstractFile[] {
+		const syncTFiles = this.vaultFilesInScope().filter(
+			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
+		);
+		const skipped = this.serverMoveRemnantRoots();
+		for (const kept of this.retainedLocalOnlyFolders()) skipped.add(kept);
+		if (skipped.size === 0) return syncTFiles;
+		return syncTFiles.filter((tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), skipped));
+	}
+
+	/**
 	 * @param allowMint Whether a local file with no existing folderIndex entry
 	 * may be minted a fresh guid this round. Pass `false` when the caller
 	 * couldn't confirm a fresh sync landed first (`_onReady()`'s 30s timeout,
@@ -957,15 +1014,7 @@ export class VaultShare extends ProviderBacked {
 	 */
 	private adoptLocalFiles = async (allowMint = true) => {
 		if (this.dormant) return;
-		let syncTFiles = this.vaultFilesInScope().filter(
-			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
-		);
-		const remnants = this.serverMoveRemnantRoots();
-		if (remnants.size > 0) {
-			syncTFiles = syncTFiles.filter(
-				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), remnants),
-			);
-		}
+		let syncTFiles = this.adoptableFiles();
 		if (!allowMint) {
 			const { known, unknown } = partitionByKnownGuid(
 				syncTFiles,
@@ -1966,15 +2015,28 @@ export class VaultShare extends ProviderBacked {
 
 		// Sweep every locally-tracked file/folder and drop whatever the server no longer shares.
 		const ffiles = this.vaultFilesInScope();
-		const folders = ffiles.filter((file) => file instanceof TFolder);
+		const folders = ffiles.filter((file): file is TFolder => file instanceof TFolder);
 		const trackedEntries = ffiles.filter((file) => file instanceof TFile);
 
 		const deletes: DeleteOp[] = [];
-		for (const file of [...trackedEntries, ...folders]) {
-			if (confirmedOnly && !this.folderIndex.wasRemoved(this.toVirtualPath(file.path))) {
-				continue;
-			}
+		const skip = (file: TAbstractFile) =>
+			confirmedOnly && !this.folderIndex.wasRemoved(this.toVirtualPath(file.path));
+		for (const file of trackedEntries) {
+			if (skip(file)) continue;
 			const op = this._maybeDeleteOrphanedFile(file, allRemotePaths, diffLog);
+			if (op) {
+				deletes.push(op);
+			}
+		}
+		// Folders go last and one at a time, deepest first: a folder is
+		// trashed only once its own deletes have settled and nothing is left
+		// in it on disk. Trashing it whole would take along files
+		// the share never synced, conflict copies and files kept this cycle.
+		folders.sort((l, r) => r.path.length - l.path.length);
+		for (const folder of folders) {
+			if (skip(folder)) continue;
+			const settled = Promise.allSettled(deletes.map((op) => op.completion));
+			const op = this._maybeDeleteOrphanedFolder(folder, allRemotePaths, settled);
 			if (op) {
 				deletes.push(op);
 			}
@@ -1982,19 +2044,103 @@ export class VaultShare extends ProviderBacked {
 		return deletes;
 	}
 
+	/** Whether the share no longer has `file` and this client is not about to publish it. */
+	private _isOrphaned(file: TAbstractFile, allRemotePaths: Set<string>): boolean {
+		const vpath = this.toVirtualPath(file.path);
+		return (
+			this.containsPath(file.path) &&
+			this.isSyncableVaultFile(file) &&
+			!allRemotePaths.has(vpath) &&
+			!this.uploadClaims.has(vpath)
+		);
+	}
+
+	/**
+	 * Whether `folder` holds anything a prune pass would leave on disk: a file
+	 * the share does not sync (an excluded type, a conflict copy), or an entry
+	 * the share still has or this client is about to publish. A subfolder
+	 * counts only through its own contents or a record of its own, so a
+	 * dotted folder name the share cannot classify (`v1.2`) pins nothing.
+	 */
+	private _holdsKeptEntries(folder: TFolder, allRemotePaths: Set<string>): boolean {
+		for (const child of folder.children ?? []) {
+			if (child instanceof TFolder) {
+				const vpath = this.toVirtualPath(child.path);
+				if (allRemotePaths.has(vpath) || this.uploadClaims.has(vpath)) return true;
+				if (this._holdsKeptEntries(child, allRemotePaths)) return true;
+			} else if (!this._isOrphaned(child, allRemotePaths)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Disk entries Obsidian never shows and the OS recreates on its own. */
+	private static readonly OS_JUNK = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+
+	/** True when `path` holds no files at any depth (OS junk aside). */
+	private async _folderIsEmptyOnDisk(path: string): Promise<boolean> {
+		try {
+			const { files, folders } = await this.vaultApi.adapter.list(path);
+			const junk = (entry: string) => VaultShare.OS_JUNK.has(entry.slice(entry.lastIndexOf("/") + 1));
+			if (!files.every(junk)) return false;
+			for (const sub of folders) {
+				if (!(await this._folderIsEmptyOnDisk(sub))) return false;
+			}
+			return true;
+		} catch {
+			// Already gone or unreadable: nothing to trash.
+			return false;
+		}
+	}
+
+	/**
+	 * A folder the share no longer has. It goes to the trash only when it is
+	 * empty after `after` (this pass's earlier deletes) settles; a folder
+	 * that still holds local-only files stays on disk, out of the share
+	 * (retainedLocalOnlyFolders()).
+	 */
+	private _maybeDeleteOrphanedFolder(
+		folder: TFolder,
+		allRemotePaths: Set<string>,
+		after: Promise<unknown>,
+	): DeleteOp | null {
+		if (!this._isOrphaned(folder, allRemotePaths)) return null;
+		if (this._holdsKeptEntries(folder, allRemotePaths)) return null;
+		const vpath = this.toVirtualPath(folder.path);
+		const trashing = (this.trashingPaths ??= new Set());
+		if (trashing.has(vpath)) return null;
+		trashing.add(vpath);
+
+		// The outcome is known only after `after` settles, past the
+		// synchronous sync-pass summary, so it is logged here.
+		const promise = after
+			.then(() => this._folderIsEmptyOnDisk(folder.path))
+			.then((empty) => {
+				if (!empty) {
+					this.debug(`kept folder ${vpath}: it still holds files the share does not sync`);
+					return;
+				}
+				return this.vaultApi.adapter.trashLocal(folder.path).then(() => {
+					this.knownBeforeSync?.delete(vpath);
+					this.log(`removed local copy of ${vpath} -- serverId no longer shares it`);
+				});
+			})
+			.finally(() => {
+				trashing.delete(vpath);
+			});
+		return { kind: "delete", filePath: vpath, completion: promise };
+	}
+
 	private _maybeDeleteOrphanedFile(
 		file: TAbstractFile,
 		allRemotePaths: Set<string>,
 		diffLog: string[],
 	): DeleteOp | null {
-		const isSyncableFile = this.isSyncableVaultFile(file);
-		const fileInFolder = this.containsPath(file.path);
-		const vpath = this.toVirtualPath(file.path);
-		const fileInMap = allRemotePaths.has(vpath);
-		const filePending = this.uploadClaims.has(vpath);
-		if (!(fileInFolder && isSyncableFile && !fileInMap && !filePending)) {
+		if (!this._isOrphaned(file, allRemotePaths)) {
 			return null;
 		}
+		const vpath = this.toVirtualPath(file.path);
 		const trashing = (this.trashingPaths ??= new Set());
 		if (trashing.has(vpath)) return null;
 		trashing.add(vpath);
@@ -2232,6 +2378,13 @@ export class VaultShare extends ProviderBacked {
 					this.pathSet.update();
 				}
 				this.refreshServerMoveRemnants();
+				// A folder kept for its local-only files is known only once the
+				// deletes inside it have settled.
+				if (deletes.length > 0) {
+					void Promise.allSettled(deletes.map((op) => op.completion)).then(() =>
+						this.refreshServerMoveRemnants(),
+					);
+				}
 			} finally {
 				// Clear the in-flight marker whether this pass succeeded or threw.
 				this.treeScanInFlight = null;
