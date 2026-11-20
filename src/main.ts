@@ -130,6 +130,7 @@ import { collectWebFolderItems, isRootSharePath, joinFolderPath, resolveShareFol
 import { FolderShareTracker } from "./FolderShareTracker";
 import { openSettingsAt } from "./settingsNavigation";
 import { ServerInfoCache } from "./serverInfoCache";
+import { isLocalRemoval } from "./localRemoval";
 
 interface LoggingSettings {
 	debugging: boolean;
@@ -783,7 +784,6 @@ export default class TeamRelayPlugin extends Plugin {
 			);
 			this.inboundFileDownloader = new InboundFileDownloader(
 				this.pluginVault,
-				this.app.fileManager,
 				this.shareClientManager,
 				this.webSyncManager,
 				hashManifestStore,
@@ -792,7 +792,7 @@ export default class TeamRelayPlugin extends Plugin {
 			// Outbound mirror of local edits into the sync protocol.
 			// Shares the downloader's base store: "the version this client
 			// pulled" is exactly what If-Match may replace.
-			const { createOutboundSyncWriter, watchShareReconnects } = await import(
+			const { createOutboundSyncWriter, liveTextTarget, readRelaySyncedText, watchShareReconnects } = await import(
 				"./outboundSyncWiring"
 			);
 			this.outboundSyncWriter = createOutboundSyncWriter({
@@ -805,6 +805,17 @@ export default class TeamRelayPlugin extends Plugin {
 			const outboundWriter = this.outboundSyncWriter;
 			this.inboundFileDownloader.setPassListener((shareId) =>
 				outboundWriter.onInboundPass(shareId),
+			);
+			// Tells a conflict whose local text is the shared live note apart
+			// from a local edit.
+			this.inboundFileDownloader.setRelayTextProbe(
+				async (vaultPath) =>
+					(await readRelaySyncedText(this.app.vault, this.shareRegistry, vaultPath)) !== null,
+			);
+			// "Use server version" replaces the note's text in place instead
+			// of trashing the shared note.
+			this.inboundFileDownloader.setLiveTextTarget((vaultPath) =>
+				liveTextTarget(this.app.vault, this.shareRegistry, vaultPath),
 			);
 			this.app.workspace.onLayoutReady(() => {
 				if (this.outboundSyncWriter !== outboundWriter) return;
@@ -1289,6 +1300,8 @@ export default class TeamRelayPlugin extends Plugin {
 		oldPath: string,
 		vaultLog: ReturnType<typeof namedLogger>,
 	): void {
+		// Before renameEntry moves the index entry: see the delete handler.
+		const localRemoval = this.isLocalSyncRemoval(oldPath);
 		// TODO an empty folder move isn't detected here yet.
 		const movedVaultShare =
 			file instanceof TFolder
@@ -1323,6 +1336,25 @@ export default class TeamRelayPlugin extends Plugin {
 		}
 		// Update web_folder_items for auto-sync folder shares
 		this.webSyncManager?.onFileRenamed(file.path, oldPath);
+		// Sync protocol: the old path is deleted, the new one written.
+		// A move in from outside every share is always this user's own.
+		const movedIn = !this.shareRegistry.shareFor(oldPath) && !!this.shareRegistry.shareFor(file.path);
+		if ((localRemoval || movedIn) && this.outboundSyncWriter) {
+			if (localRemoval) this.outboundSyncWriter.notifyLocalDelete(oldPath, file instanceof TFolder);
+			const moved =
+				file instanceof TFolder
+					? this.app.vault.getFiles().filter((f) => f.path.startsWith(`${file.path}/`))
+					: [file];
+			for (const f of moved) this.outboundSyncWriter.notifyLocalChange(f.path);
+		}
+	}
+
+	/** A delete/rename of `vaultPath` that this user made, not an inbound or peer echo. */
+	private isLocalSyncRemoval(vaultPath: string): boolean {
+		if (!this.outboundSyncWriter) return false;
+		return isLocalRemoval(this.shareRegistry, vaultPath, (path) =>
+			this.inboundFileDownloader?.isInboundWriting(path) ?? false,
+		);
 	}
 
 	/** Share-list routing of folder shares to the inbound poller; see FolderShareTracker. */
@@ -2034,6 +2066,9 @@ export default class TeamRelayPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				// Decided before anything below touches the folder index: a
+				// local delete still has its index entry, a peer's does not.
+				const localRemoval = this.isLocalSyncRemoval(file.path);
 				if (file instanceof TFolder && this.folderShares?.hasPathOnlyShares) {
 					this.folderShares.retain();
 				}
@@ -2061,6 +2096,11 @@ export default class TeamRelayPlugin extends Plugin {
 				}
 				// Update web_folder_items for auto-sync folder shares
 				this.webSyncManager?.onFileDeleted(file.path);
+				// The tree PATCH keeps sync-artifacts, so the delete is stated
+				// explicitly on the sync protocol.
+				if (localRemoval) {
+					this.outboundSyncWriter?.notifyLocalDelete(file.path, file instanceof TFolder);
+				}
 			}),
 		);
 

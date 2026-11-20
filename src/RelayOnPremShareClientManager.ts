@@ -495,7 +495,7 @@ export class RelayOnPremShareClientManager {
 	 */
 	async listAgentKeys(serverId: string, shareId: string): Promise<AgentKey[]> {
 		const client = this.clients.get(serverId);
-		if (!client) throw new Error(`No client for server ${serverId}`);
+		if (!client) throw new Error(`Server ${serverId} not found`);
 		return client.listAgentKeys(shareId);
 	}
 
@@ -504,7 +504,7 @@ export class RelayOnPremShareClientManager {
 	 */
 	async createAgentKey(serverId: string, shareId: string, request: CreateAgentKeyRequest): Promise<CreateAgentKeyResponse> {
 		const client = this.clients.get(serverId);
-		if (!client) throw new Error(`No client for server ${serverId}`);
+		if (!client) throw new Error(`Server ${serverId} not found`);
 		return client.createAgentKey(shareId, request);
 	}
 
@@ -513,7 +513,7 @@ export class RelayOnPremShareClientManager {
 	 */
 	async revokeAgentKey(serverId: string, shareId: string, keyId: string): Promise<void> {
 		const client = this.clients.get(serverId);
-		if (!client) throw new Error(`No client for server ${serverId}`);
+		if (!client) throw new Error(`Server ${serverId} not found`);
 		return client.revokeAgentKey(shareId, keyId);
 	}
 
@@ -607,5 +607,22 @@ export class RelayOnPremShareClientManager {
 			throw new Error(`Not logged in to server ${serverId}`);
 		}
 		return client.syncWriteFile(shareId, path, content, precondition, mime, options);
+	}
+
+	/** Delete one file from a folder share's sync protocol. */
+	async syncDeleteFile(
+		serverId: string,
+		shareId: string,
+		path: string,
+		ifMatchSha256: string,
+	): Promise<void> {
+		const client = this.clients.get(serverId);
+		if (!client) {
+			throw new Error(`Server ${serverId} not found`);
+		}
+		if (!this.authManager.isLoggedInToServer(serverId)) {
+			throw new Error(`Not logged in to server ${serverId}`);
+		}
+		await client.syncDeleteFile(shareId, path, ifMatchSha256);
 	}
 }
