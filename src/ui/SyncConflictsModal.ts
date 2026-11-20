@@ -3,10 +3,10 @@
  *
  * Lists files InboundFileDownloader refused to overwrite because the local
  * content diverged from what it last wrote, and lets the user pick a side:
- * "Use server version" (deletes the local file so the next sync writes the
- * server copy fresh) or "Keep local" (acknowledges today's server version
- * without touching local content, so the guard stops nagging until the
- * server side changes again).
+ * "Use server version" (replaces the note's text with the relay's sync copy
+ * in place, an ordinary edit every member of the share receives) or "Keep
+ * local" (acknowledges today's server version without touching local
+ * content, so the guard stops nagging until the server side changes again).
  */
 
 import { App, Modal, Notice, Setting } from "obsidian";
@@ -66,20 +66,24 @@ export class SyncConflictsModal extends Modal {
 				setDestructiveButton(button).setButtonText("Use server version").onClick(async () => {
 					const ok = await confirmDialog(
 						this.app,
-						conflict.localSource === "relay"
-							? `"${conflict.vaultPath}" is the shared live note. Replacing it moves ` +
-								`it to trash, which removes it from the shared folder for everyone ` +
-								`in the share, and then downloads the relay's sync copy in its ` +
-								`place; lines that exist only in the live note are lost. Continue?`
-							: `Discard local changes to "${conflict.vaultPath}" and replace it with the ` +
-								`relay version on the next sync?`,
+						`Replace the text of "${conflict.vaultPath}" with the relay's sync copy? ` +
+							`The note changes for everyone in the share, and lines that exist only ` +
+							`in the live note are lost.`,
 					);
 					if (!ok) return;
-					await this.plugin.inboundFileDownloader?.resolveTakeServer(
-						conflict.shareId,
-						conflict.relativePath,
-					);
-					new Notice(`Team Relay: will re-download "${conflict.relativePath}" from the relay.`);
+					try {
+						await this.plugin.inboundFileDownloader?.resolveTakeServer(
+							conflict.shareId,
+							conflict.relativePath,
+						);
+					} catch (err: unknown) {
+						new Notice(
+							`Team Relay: could not use the server version of "${conflict.relativePath}": ` +
+								(err instanceof Error ? err.message : String(err)),
+						);
+						return;
+					}
+					new Notice(`Team Relay: "${conflict.relativePath}" now has the relay version.`);
 					this.render();
 				});
 			});

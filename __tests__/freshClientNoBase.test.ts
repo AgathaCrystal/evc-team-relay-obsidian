@@ -19,7 +19,7 @@
 
 import { describe, test, expect, beforeEach, jest } from "@jest/globals";
 import { TFile } from "obsidian";
-import type { FileManager, Vault } from "obsidian";
+import type { Vault } from "obsidian";
 
 const textOf = (data: ArrayBuffer): string => new TextDecoder().decode(data);
 const sha = (text: string): string => `sha(${text})`;
@@ -168,8 +168,15 @@ function setup() {
 		adapter,
 		getAbstractFileByPath: (path: string) => (disk.has(path) ? mockTFile(path) : null),
 		readBinary: async (file: TFile) => bytes(disk.get(file.path) ?? ""),
+		modifyBinary: jest.fn(async (file: TFile, data: ArrayBuffer) => {
+			disk.set(file.path, textOf(data));
+		}),
 	};
-	const trashFile = jest.fn<(file: TFile) => Promise<void>>();
+	// Deleting a note in a shared folder removes it from the CRDT for every
+	// member; recorded here so a test can prove it never happens.
+	const trashFile = jest.fn(async (file: TFile) => {
+		disk.delete(file.path);
+	});
 	const clientManager = {
 		getShare: async () => ({ id: SHARE, path: FOLDER }),
 		getFilesIndex: async () => server.index(),
@@ -177,7 +184,6 @@ function setup() {
 	};
 	const downloader = new InboundFileDownloader(
 		vault as unknown as Vault,
-		{ trashFile } as unknown as FileManager,
 		clientManager as never,
 		{ isOutboundSyncing: false } as never,
 		baseStore,
@@ -197,7 +203,7 @@ function setup() {
 	});
 	downloader.setPassListener((shareId) => writer.onInboundPass(shareId));
 	const base = (): string | undefined => baseStore.get(SHARE)?.[PATH];
-	return { clock, server, disk, baseStore, adapter, downloader, writer, base, trashFile };
+	return { clock, server, disk, baseStore, adapter, vault, downloader, writer, base, trashFile };
 }
 
 // ─── 2. downloader ──────────────────────────────────────────────────────────
@@ -326,5 +332,121 @@ describe("fresh client: an ordinary edit reaches the sync protocol without manua
 		await clock.advance(0);
 
 		expect(server.items.get(PATH)).toEqual({ content: EDITED, origin: "crdt" });
+	});
+});
+
+// ─── 4. "Use server version" ────────────────────────────────────
+//
+// It used to trash the local file: in a shared folder that delete reaches the
+// CRDT and the note disappears for every member, and only this device got the
+// sync copy back. Now the local text is replaced in place, as an ordinary edit.
+
+describe("Use server version replaces the text in place", () => {
+	const SERVER_TEXT = "# Roundtrip\nLine edited by an agent.\n";
+
+	async function conflicted() {
+		const env = setup();
+		env.server.put(PATH, SERVER_TEXT, "external");
+		env.disk.set(VAULT_PATH, CRDT);
+		await env.downloader.downloadShare(SHARE, SERVER);
+		expect(env.downloader.getConflicts()).toHaveLength(1);
+		return env;
+	}
+
+	test("the note is never trashed; its text becomes the server bytes and the base the server sha", async () => {
+		const env = await conflicted();
+
+		await env.downloader.resolveTakeServer(SHARE, PATH);
+
+		expect(env.trashFile).not.toHaveBeenCalled();
+		expect(env.disk.get(VAULT_PATH)).toBe(SERVER_TEXT);
+		expect(env.base()).toBe(sha(SERVER_TEXT));
+		expect(env.downloader.getConflicts()).toEqual([]);
+	});
+
+	test("the next pass has no conflict and writes nothing; the writer pushes nothing", async () => {
+		const env = await conflicted();
+		await env.downloader.resolveTakeServer(SHARE, PATH);
+		env.adapter.writeBinary.mockClear();
+		const downloadsBefore = env.server.downloads;
+
+		await env.downloader.downloadShare(SHARE, SERVER);
+		env.writer.notifyLocalChange(VAULT_PATH);
+		await env.clock.advance(OUTBOUND_DEBOUNCE_MS);
+		await env.writer.idle();
+
+		expect(env.downloader.getConflicts()).toEqual([]);
+		expect(env.adapter.writeBinary).not.toHaveBeenCalled();
+		expect(env.server.downloads).toBe(downloadsBefore);
+		expect(env.server.writes).toEqual([]);
+		expect(env.server.items.get(PATH)).toEqual({ content: SERVER_TEXT, origin: "external" });
+	});
+
+	test("a note with a live CRDT document gets the server text there, and the disk write is no new edit", async () => {
+		const env = await conflicted();
+		let crdtText = CRDT;
+		const writingDuringDiskWrite: boolean[] = [];
+		env.vault.modifyBinary.mockImplementation(async (file: TFile, data: ArrayBuffer) => {
+			writingDuringDiskWrite.push(env.downloader.isInboundWriting(file.path));
+			env.disk.set(file.path, textOf(data));
+		});
+		env.downloader.setLiveTextTarget(async (vaultPath) => {
+			expect(vaultPath).toBe(VAULT_PATH);
+			return (text) => {
+				crdtText = text;
+			};
+		});
+
+		await env.downloader.resolveTakeServer(SHARE, PATH);
+
+		expect(crdtText).toBe(SERVER_TEXT);
+		expect(env.disk.get(VAULT_PATH)).toBe(SERVER_TEXT);
+		expect(writingDuringDiskWrite).toEqual([true]);
+		expect(env.downloader.isInboundWriting(VAULT_PATH)).toBe(false);
+		expect(env.trashFile).not.toHaveBeenCalled();
+	});
+
+	test("without a live document the file is written as an ordinary edit (the modify handler carries it)", async () => {
+		const env = await conflicted();
+		const writingDuringDiskWrite: boolean[] = [];
+		env.vault.modifyBinary.mockImplementation(async (file: TFile, data: ArrayBuffer) => {
+			writingDuringDiskWrite.push(env.downloader.isInboundWriting(file.path));
+			env.disk.set(file.path, textOf(data));
+		});
+		env.downloader.setLiveTextTarget(async () => null);
+
+		await env.downloader.resolveTakeServer(SHARE, PATH);
+
+		expect(writingDuringDiskWrite).toEqual([false]);
+		expect(env.disk.get(VAULT_PATH)).toBe(SERVER_TEXT);
+	});
+
+	test("a failed disk write leaves the shared CRDT text and the conflict untouched", async () => {
+		const env = await conflicted();
+		let crdtText = CRDT;
+		env.vault.modifyBinary.mockRejectedValueOnce(new Error("Disk full"));
+		env.downloader.setLiveTextTarget(async () => (text) => {
+			crdtText = text;
+		});
+
+		await expect(env.downloader.resolveTakeServer(SHARE, PATH)).rejects.toThrow("Disk full");
+
+		expect(crdtText).toBe(CRDT);
+		expect(env.disk.get(VAULT_PATH)).toBe(CRDT);
+		expect(env.base()).toBeUndefined();
+		expect(env.downloader.getConflicts()).toHaveLength(1);
+		expect(env.downloader.isInboundWriting(VAULT_PATH)).toBe(false);
+	});
+
+	test("a failed download keeps the conflict and leaves the note untouched", async () => {
+		const env = await conflicted();
+		env.server.items.delete(PATH);
+
+		await expect(env.downloader.resolveTakeServer(SHARE, PATH)).rejects.toThrow(RelayHttpError);
+
+		expect(env.disk.get(VAULT_PATH)).toBe(CRDT);
+		expect(env.base()).toBeUndefined();
+		expect(env.downloader.getConflicts()).toHaveLength(1);
+		expect(env.trashFile).not.toHaveBeenCalled();
 	});
 });

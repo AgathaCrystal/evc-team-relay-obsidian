@@ -6,7 +6,6 @@
  */
 
 import { normalizePath, Notice, TFile, Vault } from "obsidian";
-import type { FileManager } from "obsidian";
 import { dirname, join } from "path-browserify";
 import { namedLogger } from "./logging";
 import { isTransientRelayFailure } from "./relayRequestErrors";
@@ -22,6 +21,7 @@ const log = namedLogger("[InboundFileDownloader]");
  * `getConflicts()` for the "Team Relay: Show sync conflicts" command. */
 export interface SyncConflict {
 	shareId: string;
+	serverId: string;
 	relativePath: string;
 	vaultPath: string;
 	localHash: string;
@@ -93,9 +93,13 @@ export class InboundFileDownloader {
 	// came from.
 	private relayTextProbe: ((vaultPath: string) => Promise<boolean>) | null = null;
 
+	// Resolves a function that sets the note's live CRDT text,
+	// or null when the path has no CRDT document; then the caller writes the
+	// file as an ordinary edit.
+	private liveTextTarget: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null = null;
+
 	constructor(
 		vault: Vault,
-		private readonly fileManager: FileManager,
 		clientManager: RelayOnPremShareClientManager,
 		webSyncManager: WebSyncManager,
 		hashManifestStore: Map<string, Record<string, string>> = new Map(),
@@ -120,6 +124,10 @@ export class InboundFileDownloader {
 
 	setRelayTextProbe(probe: ((vaultPath: string) => Promise<boolean>) | null): void {
 		this.relayTextProbe = probe;
+	}
+
+	setLiveTextTarget(target: ((vaultPath: string) => Promise<((text: string) => void) | null>) | null): void {
+		this.liveTextTarget = target;
 	}
 
 	/**
@@ -308,6 +316,7 @@ export class InboundFileDownloader {
 					existing.serverHash === serverSha256;
 				this.conflicts.set(conflictKey, {
 					shareId,
+					serverId,
 					relativePath,
 					vaultPath,
 					localHash,
@@ -340,7 +349,7 @@ export class InboundFileDownloader {
 			}
 		}
 		// Reaching here means we're about to download: either the local file is
-		// gone (deleted manually, or via resolveTakeServer()) or its content now
+		// gone (deleted manually) or its content now
 		// matches what we expected. Either way any previously-tracked conflict
 		// for this path is stale — drop it so getConflicts() doesn't list a file
 		// that's no longer actually in conflict.
@@ -460,20 +469,57 @@ export class InboundFileDownloader {
 	}
 
 	/**
-	 * Resolve a conflict by taking the server version: trash the local file so the
-	 * next `downloadShare()` pass finds no local content to guard and writes the
-	 * server copy fresh. Mirrors the manual recipe this bug's report used to fix
-	 * the one already-live conflict by hand.
+	 * Resolve a conflict by taking the server version: replace the
+	 * local text with the relay's sync copy in place, as an ordinary edit. The
+	 * file is never trashed: a delete in a shared folder reaches the CRDT and
+	 * removes the note for everyone in the share.
+	 *
+	 * A note with a live CRDT document gets the same bytes on disk under the echo
+	 * guard first, and only once that write succeeded the server text in its
+	 * CRDT (the relay carries the change to the other members): a failed write
+	 * leaves the shared note and the conflict untouched. Any other file is
+	 * written with an ordinary vault modify, so the usual modify handling
+	 * carries it to the relay. The server hash becomes the base, so the next
+	 * pass sees no conflict and the outbound writer finds local = server and
+	 * pushes nothing.
 	 */
 	async resolveTakeServer(shareId: string, relativePath: string): Promise<void> {
 		const key = `${shareId}:${relativePath}`;
 		const conflict = this.conflicts.get(key);
 		if (!conflict) return;
-		const abstractFile = this.vault.getAbstractFileByPath(conflict.vaultPath);
-		if (abstractFile instanceof TFile) {
-			await this.fileManager.trashFile(abstractFile);
+		const { vaultPath, serverId } = conflict;
+		const abstractFile = this.vault.getAbstractFileByPath(vaultPath);
+		if (!(abstractFile instanceof TFile)) {
+			// Nothing local left to replace: the next pass writes the server copy.
+			this.conflicts.delete(key);
+			return;
 		}
+
+		const serverBytes = await this.clientManager.downloadFile(serverId, shareId, relativePath);
+		const serverHash = await sha256Hex(serverBytes);
+		const applyLive =
+			this.liveTextTarget && isComparableTextPath(relativePath)
+				? await this.liveTextTarget(vaultPath)
+				: null;
+
+		if (applyLive) {
+			// The CRDT gets this text right after; the disk write is not a new edit.
+			this.writingPaths.add(vaultPath);
+			try {
+				await this.vault.modifyBinary(abstractFile, serverBytes);
+			} finally {
+				this.writingPaths.delete(vaultPath);
+			}
+			applyLive(new TextDecoder().decode(serverBytes));
+		} else {
+			await this.vault.modifyBinary(abstractFile, serverBytes);
+		}
+
+		const shareManifest = { ...(this.lastWrittenHash.get(shareId) ?? {}) };
+		shareManifest[relativePath] = serverHash;
+		this.lastWrittenHash.set(shareId, shareManifest);
 		this.conflicts.delete(key);
+		log("Replaced local text with the server version", { vaultPath, serverHash, live: applyLive !== null });
 	}
 
 	/**

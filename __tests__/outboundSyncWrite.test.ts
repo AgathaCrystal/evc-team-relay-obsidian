@@ -36,7 +36,7 @@ import {
 } from "src/OutboundSyncWriter";
 import { InboundFileDownloader } from "src/InboundFileDownloader";
 import { RelayHttpError } from "src/relayRequestErrors";
-import type { FileManager, Vault } from "obsidian";
+import type { Vault } from "obsidian";
 
 const flushPromises = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
@@ -447,7 +447,6 @@ describe("InboundFileDownloader with origin", () => {
 		manifest = new Map();
 		downloader = new InboundFileDownloader(
 			{ ...vault, readBinary: fakes.readBinary } as unknown as Vault,
-			{ trashFile: jest.fn() } as unknown as FileManager,
 			clientManager as never,
 			{ isOutboundSyncing: false } as never,
 			manifest,

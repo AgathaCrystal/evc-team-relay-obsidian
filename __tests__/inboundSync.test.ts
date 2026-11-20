@@ -29,7 +29,7 @@ import { InboundFileDownloader } from "src/InboundFileDownloader";
 import { RelayHttpError } from "src/relayRequestErrors";
 import type { RelayOnPremShareClientManager } from "src/RelayOnPremShareClientManager";
 import type { WebSyncManager } from "src/WebSyncManager";
-import type { FileManager, Vault } from "obsidian";
+import type { Vault } from "obsidian";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -85,16 +85,19 @@ function makeMockVault() {
 	const getAbstractFileByPath = jest.fn<(path: string) => TFile | null>().mockReturnValue(null);
 	const readBinary = jest.fn<() => Promise<ArrayBuffer>>().mockResolvedValue(new ArrayBuffer(4));
 	const del = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
+	const modifyBinary = jest.fn<(file: TFile, data: ArrayBuffer) => Promise<void>>().mockResolvedValue(undefined);
 	return {
 		getAbstractFileByPath,
 		readBinary,
 		delete: del,
+		modifyBinary,
 		adapter,
 	} as unknown as Vault & {
 		adapter: typeof adapter;
 		getAbstractFileByPath: typeof getAbstractFileByPath;
 		readBinary: typeof readBinary;
 		delete: typeof del;
+		modifyBinary: typeof modifyBinary;
 	};
 }
 
@@ -378,9 +381,6 @@ describe("InboundFileDownloader", () => {
 	let clientManager: ReturnType<typeof makeMockClientManager>;
 	let webSyncManager: { isOutboundSyncing: boolean };
 	let vault: ReturnType<typeof makeMockVault>;
-	let fileManager: Pick<FileManager, "trashFile"> & {
-		trashFile: jest.Mock<FileManager["trashFile"]>;
-	};
 	let downloader: InboundFileDownloader;
 
 	beforeEach(() => {
@@ -389,8 +389,7 @@ describe("InboundFileDownloader", () => {
 		clientManager = makeMockClientManager();
 		webSyncManager = { isOutboundSyncing: false };
 		vault = makeMockVault();
-		fileManager = { trashFile: jest.fn<FileManager["trashFile"]>().mockResolvedValue(undefined) };
-		downloader = new InboundFileDownloader(vault, fileManager as unknown as FileManager, clientManager as any, webSyncManager as any);
+		downloader = new InboundFileDownloader(vault, clientManager as any, webSyncManager as any);
 	});
 
 	test("skips download when outbound sync is in flight", async () => {
@@ -534,7 +533,7 @@ describe("InboundFileDownloader", () => {
 		Object.assign(new Error("Socket failed"), { code: "ETIMEDOUT" })])(
 		"stops the remaining batch after a transient download failure: %s", async (failure) => {
 			const persistedHashes = new Map<string, Record<string, string>>();
-			downloader = new InboundFileDownloader(vault, fileManager as unknown as FileManager,
+			downloader = new InboundFileDownloader(vault,
 				clientManager as any, webSyncManager as any, persistedHashes);
 			clientManager.getFilesIndex.mockResolvedValue([
 				{ path: "one.md", sha256: "hash-aabbcc", size: 4, updated_at: "now", type: "sync-artifact" },
@@ -763,7 +762,6 @@ describe("InboundFileDownloader", () => {
 
 			const firstSession = new InboundFileDownloader(
 				vault,
-				fileManager as unknown as FileManager,
 				clientManager as any,
 				webSyncManager as any,
 				persistedStore,
@@ -785,7 +783,6 @@ describe("InboundFileDownloader", () => {
 			// store — this is what main.ts does via VaultScopedMap across a real restart.
 			const secondSession = new InboundFileDownloader(
 				vault,
-				fileManager as unknown as FileManager,
 				clientManager as any,
 				webSyncManager as any,
 				persistedStore,
@@ -870,7 +867,6 @@ describe("InboundFileDownloader", () => {
 			const persistedStore = new Map<string, Record<string, string>>();
 			const persistentDownloader = new InboundFileDownloader(
 				vault,
-				fileManager as unknown as FileManager,
 				clientManager as any,
 				webSyncManager as any,
 				persistedStore,
@@ -960,26 +956,29 @@ describe("InboundFileDownloader", () => {
 			});
 		});
 
-		test("resolveTakeServer() uses FileManager.trashFile and clears the conflict", async () => {
+		test("resolveTakeServer() rewrites the note with the server bytes instead of trashing it", async () => {
 			conflictSetup();
 			await downloader.downloadShare(SHARE_ID, SERVER_ID);
 			expect(downloader.getConflicts()).toHaveLength(1);
 			const localFile = vault.getAbstractFileByPath(`${SHARE_PATH}/note.md`);
 			if (!localFile) throw new Error("Expected the conflicting local file");
+			const serverBytes = new ArrayBuffer(8);
+			clientManager.downloadFile.mockResolvedValue(serverBytes);
+			mockGenerateHash.mockResolvedValue("server-hash-1");
 
 			await downloader.resolveTakeServer(SHARE_ID, "note.md");
 
-			expect(fileManager.trashFile).toHaveBeenCalledTimes(1);
-			expect(fileManager.trashFile).toHaveBeenCalledWith(localFile);
+			expect(clientManager.downloadFile).toHaveBeenCalledWith(SERVER_ID, SHARE_ID, "note.md");
+			expect(vault.modifyBinary).toHaveBeenCalledWith(localFile as TFile, serverBytes);
 			expect(vault.delete).not.toHaveBeenCalled();
 			expect(downloader.getConflicts()).toHaveLength(0);
 		});
 
-		test("resolveTakeServer() retains the conflict when trashFile fails", async () => {
+		test("resolveTakeServer() retains the conflict when the write fails", async () => {
 			conflictSetup();
 			await downloader.downloadShare(SHARE_ID, SERVER_ID);
-			const error = new Error("Trash unavailable");
-			fileManager.trashFile.mockRejectedValueOnce(error);
+			const error = new Error("Disk full");
+			vault.modifyBinary.mockRejectedValueOnce(error);
 
 			await expect(downloader.resolveTakeServer(SHARE_ID, "note.md")).rejects.toThrow(error);
 
@@ -987,20 +986,19 @@ describe("InboundFileDownloader", () => {
 			expect(vault.delete).not.toHaveBeenCalled();
 		});
 
-		test("resolveTakeServer() then the next sync cycle downloads the server version", async () => {
+		test("resolveTakeServer() then the next sync cycle neither conflicts nor re-downloads", async () => {
 			conflictSetup();
 			await downloader.downloadShare(SHARE_ID, SERVER_ID);
+			mockGenerateHash.mockResolvedValue("server-hash-1");
 			await downloader.resolveTakeServer(SHARE_ID, "note.md");
-
-			// File is gone now — next cycle sees no local file at all.
-			vault.getAbstractFileByPath.mockReturnValue(null);
-			const content = new ArrayBuffer(4);
-			clientManager.downloadFile.mockResolvedValue(content);
+			jest.clearAllMocks();
 
 			await downloader.downloadShare(SHARE_ID, SERVER_ID);
 
-			expect(clientManager.downloadFile).toHaveBeenCalledWith(SERVER_ID, SHARE_ID, "note.md");
-			expect(vault.adapter.writeBinary).toHaveBeenCalledWith(`${SHARE_PATH}/note.md`, content);
+			expect(clientManager.downloadFile).not.toHaveBeenCalled();
+			expect(vault.adapter.writeBinary).not.toHaveBeenCalled();
+			expect(noticeMock).not.toHaveBeenCalled();
+			expect(downloader.getConflicts()).toHaveLength(0);
 		});
 
 		test("resolveKeepLocal() does NOT touch the local file and clears the conflict", async () => {
@@ -1010,7 +1008,7 @@ describe("InboundFileDownloader", () => {
 			downloader.resolveKeepLocal(SHARE_ID, "note.md");
 
 			expect(vault.delete).not.toHaveBeenCalled();
-			expect(fileManager.trashFile).not.toHaveBeenCalled();
+			expect(vault.modifyBinary).not.toHaveBeenCalled();
 			expect(vault.adapter.writeBinary).not.toHaveBeenCalled();
 			expect(downloader.getConflicts()).toHaveLength(0);
 		});
@@ -1062,7 +1060,7 @@ describe("InboundFileDownloader", () => {
 			await expect(downloader.resolveTakeServer("no-such-share", "nope.md")).resolves.toBeUndefined();
 			expect(() => downloader.resolveKeepLocal("no-such-share", "nope.md")).not.toThrow();
 			expect(vault.delete).not.toHaveBeenCalled();
-			expect(fileManager.trashFile).not.toHaveBeenCalled();
+			expect(vault.modifyBinary).not.toHaveBeenCalled();
 		});
 
 		test("getConflicts() is empty when there are no conflicts", () => {

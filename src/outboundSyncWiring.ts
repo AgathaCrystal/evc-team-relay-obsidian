@@ -19,6 +19,7 @@ import {
 import type { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
 import { sameTextContent } from "./textEquivalence";
 import { toFolderRelativePath } from "./vaultRootPath";
+import { applyDiffToYText } from "./ytextDiff";
 import type { ShareRegistry, VaultShare } from "./VaultShare";
 
 const log = namedLogger("[OutboundSyncWiring]");
@@ -66,6 +67,32 @@ export async function readRelaySyncedText(
 		return entry.isSynced ? disk : null;
 	}
 	return null;
+}
+
+/** Transaction origin of "Use server version", distinct from any editor or document. */
+export const TAKE_SERVER_ORIGIN = "take-server-version";
+
+/**
+ * A function that replaces a note's live CRDT text as an ordinary edit:
+ * the relay carries it to every member of the share and an open
+ * editor follows it. Waits for the locally persisted CRDT state first so the
+ * diff is taken against the real text, not an empty document. Resolves null
+ * when the path has no CRDT document (not in a folder share, not a note); the
+ * caller then writes the file instead.
+ */
+export async function liveTextTarget(
+	vault: Vault,
+	shareRegistry: ShareRegistry,
+	vaultPath: string,
+): Promise<((text: string) => void) | null> {
+	const folder = shareRegistry.shareFor(vaultPath);
+	if (!folder) return null;
+	const tfile = vault.getAbstractFileByPath(vaultPath);
+	if (!(tfile instanceof TFile)) return null;
+	const entry = folder.rootRelative.entryFor(tfile);
+	if (!entry || !isDocument(entry)) return null;
+	await entry.awaitFirstSync();
+	return (text) => applyDiffToYText(entry.crdtDoc, text, TAKE_SERVER_ORIGIN);
 }
 
 export function createOutboundSyncWriter(opts: {
