@@ -96,6 +96,11 @@ const messageHandlers: Array<HandlerFunction> = [];
 
 messageHandlers[messageSync] = (encoder, decoder, provider, emitSynced) => {
 	encoding.writeVarUint(encoder, messageSync);
+	// Peek without consuming: readSyncMessage below reads the same bytes.
+	const peek = decoding.createDecoder(decoder.arr.subarray(decoder.pos));
+	if (decoding.readVarUint(peek) === syncProtocol.messageYjsSyncStep1) {
+		provider.relayStateVector = decoding.readVarUint8Array(peek);
+	}
 	const syncMessageType = syncProtocol.readSyncMessage(
 		decoder,
 		encoder,
@@ -274,6 +279,7 @@ const openWS = (provider: YSweetProvider, ticket: ConnectTicket): void => {
 	provider.wsconnecting = true;
 	provider.wsconnected = false;
 	provider.synced = false;
+	provider.relayStateVector = null;
 
 	// A handshake stuck this long would hold every other socket to this
 	// server behind it: give up the turn and retry through onclose.
@@ -451,6 +457,13 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	connectTicket: ConnectTicket | null = null;
 	/** Handshakes given up in a row; each one doubles the next timeout. */
 	handshakeTimeoutsInRow = 0;
+	/**
+	 * The state vector the relay announced in its sync step 1 on the current
+	 * connection; null until it arrives. A room the relay is still loading
+	 * from storage announces an empty one, so a reader can tell
+	 * an authoritative sync from a placeholder's.
+	 */
+	relayStateVector: Uint8Array | null = null;
 	wsLastMessageReceived = 0;
 	shouldConnect: boolean;
 	maxConnectionErrors: number;

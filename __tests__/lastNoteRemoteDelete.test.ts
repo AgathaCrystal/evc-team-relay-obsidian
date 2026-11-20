@@ -46,6 +46,15 @@ class Peer {
 						this.trashed.push(path);
 						this.files = this.files.filter((f) => f.path !== path);
 					},
+					list: async (path: string) => {
+						const children = this.files.filter(
+							(f) => f.path.slice(0, f.path.lastIndexOf("/")) === path,
+						);
+						return {
+							files: children.filter((f) => f instanceof TFile).map((f) => f.path),
+							folders: children.filter((f) => f instanceof TFolder).map((f) => f.path),
+						};
+					},
 				},
 			},
 			log: jest.fn(),
