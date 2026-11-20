@@ -12,6 +12,8 @@
 
 import { describe, test, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import * as Y from "yjs";
+import * as encoding from "lib0/encoding";
+import * as syncProtocol from "y-protocols/sync";
 import { YSweetProvider } from "../src/client/provider";
 import { testGlobal } from "./mocks/testGlobal";
 import { resetConnectGate } from "../src/client/connectGate";
@@ -270,5 +272,66 @@ describe("YSweetProvider reconnect", () => {
 		expect(provider.connectTrace.skipped).toBeUndefined();
 		latestSocket().succeed();
 		expect(provider.connectTrace.openAt).toBeDefined();
+	});
+});
+
+describe("YSweetProvider records the relay's announced state vector.", () => {
+	let provider: YSweetProvider;
+
+	beforeEach(() => {
+		jest.useFakeTimers();
+		MockWebSocket.instances = [];
+	});
+
+	afterEach(() => {
+		provider?.destroy();
+		jest.useRealTimers();
+	});
+
+	function syncMessage(write: (encoder: encoding.Encoder) => void): { data: ArrayBuffer } {
+		const encoder = encoding.createEncoder();
+		encoding.writeVarUint(encoder, 0); // messageSync
+		write(encoder);
+		const bytes = encoding.toUint8Array(encoder);
+		return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer };
+	}
+
+	test("keeps the relay's sync step 1 state vector and still applies the sync", () => {
+		const relay = new Y.Doc();
+		relay.getText("contents").insert(0, "stored text\n");
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			disableBc: true,
+		});
+		const ws = latestSocket();
+		ws.succeed();
+		expect(provider.relayStateVector).toBeNull();
+
+		ws.onmessage?.(syncMessage((encoder) => syncProtocol.writeSyncStep1(encoder, relay)));
+		ws.onmessage?.(syncMessage((encoder) => syncProtocol.writeSyncStep2(encoder, relay)));
+
+		expect(Y.decodeStateVector(provider.relayStateVector!)).toEqual(Y.decodeStateVector(Y.encodeStateVector(relay)));
+		expect(doc.getText("contents").toString()).toBe("stored text\n");
+		expect(provider.synced).toBe(true);
+	});
+
+	test("a placeholder's empty state vector is kept as empty, and a new socket forgets it", () => {
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			maxBackoffTime: 1000,
+			disableBc: true,
+		});
+		const ws = latestSocket();
+		ws.succeed();
+		ws.onmessage?.(syncMessage((encoder) => syncProtocol.writeSyncStep1(encoder, new Y.Doc())));
+		expect(Y.decodeStateVector(provider.relayStateVector!).size).toBe(0);
+
+		ws.failToConnect();
+		jest.advanceTimersByTime(1000);
+
+		expect(MockWebSocket.instances.length).toBe(2);
+		expect(provider.relayStateVector).toBeNull();
 	});
 });

@@ -815,7 +815,7 @@ export default class TeamRelayPlugin extends Plugin {
 			// "Use server version" replaces the note's text in place instead
 			// of trashing the shared note.
 			this.inboundFileDownloader.setLiveTextTarget((vaultPath) =>
-				liveTextTarget(this.app.vault, this.shareRegistry, vaultPath),
+				liveTextTarget(this.app.vault, this.shareRegistry, this.clock, vaultPath),
 			);
 			this.app.workspace.onLayoutReady(() => {
 				if (this.outboundSyncWriter !== outboundWriter) return;

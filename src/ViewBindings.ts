@@ -37,6 +37,7 @@ import { LiveNode } from "./y-codemirror.next/LiveNodePlugin";
 import { currentToggles } from "./featureToggleState";
 import { PresenceTitleDecorator } from "./PresenceTitleDecorator";
 import { TextViewPatch } from "./TextViewPatch";
+import { applyShareConnectionGate, isSignedInForShare } from "./shareConnectionGate";
 import { ItemKind } from "./ItemKinds";
 
 /**
@@ -983,7 +984,7 @@ export class ViewBindingRegistry {
 		errorLabel: string,
 		makeLive: (folder: VaultShare) => ViewBinding,
 	): void {
-		if (!this.authSession.isAuthenticated) {
+		if (!isSignedInForShare(this.authSession, folder)) {
 			views.push(
 				new SignedOutViewBinding(this, view, () => this.authSession.presentLoginPage()),
 			);
@@ -1191,15 +1192,12 @@ export class ViewBindingRegistry {
 			return true; // no live views open
 		}
 
-		if (this.authSession.isAuthenticated && this.serviceHealth.isOnline) {
-			activeDocumentFolders.forEach((folder) => {
-				void folder.bringOnline();
-			});
-		} else {
-			this.shareRegistry.each((folder) => {
-				folder.goOffline();
-			});
-		}
+		applyShareConnectionGate({
+			auth: this.authSession,
+			serviceOnline: this.serviceHealth.isOnline,
+			allShares: this.shareRegistry.toArray(),
+			openShares: activeDocumentFolders,
+		});
 
 		const [matching, stale] = this.reconcileViewSets(views);
 		this.logViewSummary(ctx, "Releasing Views", stale);
