@@ -121,7 +121,6 @@ function relayRoomLoaded(stateVector: Uint8Array | null | undefined): boolean {
  *
  * Resolves null when the path has no CRDT document (not in a folder share,
  * not a note); the caller then writes the file instead.
->>>>>>> ../m/theirs/src/outboundSyncWiring.ts
  */
 export async function liveTextTarget(
 	vault: Vault,
